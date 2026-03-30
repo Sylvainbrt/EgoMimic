@@ -17,7 +17,7 @@ from egomimic.utils.egomimicUtils import (
 
 from scipy.spatial.transform import Rotation as Rot
 import matplotlib.pyplot as plt
-from rpl_vision_utils.utils.apriltag_detector import AprilTagDetector
+from pupil_apriltags import Detector
 
 
 def parse_args():
@@ -55,7 +55,7 @@ def main():
 
     calib = h5py.File(args.h5py_path, "r+")
 
-    april_detector = AprilTagDetector(quad_decimate=1.0)
+    april_detector = Detector()
 
     # TODO get intrinsics
     # with open(os.path.join(args.config_folder, f"camera_{args.camera_id}_{args.camera_type}.json"), "r") as f:
@@ -73,6 +73,10 @@ def main():
 
     print(intrinsics)
 
+    if args.debug:
+        import os
+        os.makedirs("calibration_imgs", exist_ok=True)
+
     R_base2gripper_list = []
     t_base2gripper_list = []
     R_target2cam_list = []
@@ -89,11 +93,19 @@ def main():
             #     img, WIDE_LENS_ROBOT_LEFT_K[:, :3], WIDE_LENS_ROBOT_LEFT_D
             # )
 
+            # pupil-apriltags requires grayscale images
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            
+            # Extract [fx, fy, cx, cy] from the intrinsics matrix
+            K = intrinsics["color"]
+            camera_params = [K['fx'], K['fy'], K['cx'], K['cy']]
+
+            # Assuming you instantiated: april_detector = pupil_apriltags.Detector()
             detect_result = april_detector.detect(
-                img,
-                intrinsics=intrinsics["color"],
-                # tag_size=0.0958)
-                tag_size=0.17541875,
+                gray,
+                estimate_tag_pose=True,
+                camera_params=camera_params,
+                tag_size=0.175,
             )
 
             if len(detect_result) != 1:
@@ -106,12 +118,19 @@ def main():
             bounding_box_corners = detect_result[0].corners
             # draw bounding box on img and save
             if args.debug:
-                img = april_detector.vis_tag(img)
+                # pupil-apriltags doesn't have vis_tag, draw corners manually if needed
+                for j in range(4):
+                    pt1 = (int(bounding_box_corners[j][0]), int(bounding_box_corners[j][1]))
+                    pt2 = (int(bounding_box_corners[(j + 1) % 4][0]), int(bounding_box_corners[(j + 1) % 4][1]))
+                    cv2.line(img, pt1, pt2, (0, 255, 0), 2)
                 plt.imsave(f"calibration_imgs/{t}_detection.png", img)
 
             count += 1
+            print(list(demo["obs"].keys()))
             pose = demo["obs/ee_pose_robot_frame"][t]
-            assert pose.shape == (7,)
+            print("Pose:", pose)
+            if pose.shape != (7,):
+                raise ValueError(f"Expected pose shape (7,), but got {pose.shape}. Please check the pose format.")
             pos = pose[0:3]
             rot = Rot.from_quat(pose[3:])
 
@@ -133,9 +152,9 @@ def main():
     for method in [
         cv2.CALIB_HAND_EYE_TSAI,
         cv2.CALIB_HAND_EYE_PARK,
-        # cv2.CALIB_HAND_EYE_DANIILIDIS,
-        # cv2.CALIB_HAND_EYE_ANDREFF,
-        # cv2.CALIB_HAND_EYE_HORAUD
+        cv2.CALIB_HAND_EYE_DANIILIDIS,
+        cv2.CALIB_HAND_EYE_ANDREFF,
+        cv2.CALIB_HAND_EYE_HORAUD
     ]:
         R, t = cv2.calibrateHandEye(
             R_base2gripper_list,

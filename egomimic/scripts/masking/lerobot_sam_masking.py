@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from egomimic.utils.egomimicUtils import ARIA_INTRINSICS, EXTRINSICS
 # Use ariaJul29 extrinsics to test, to be calibrated later
-ROBOT_EXTRINSICS = EXTRINSICS["ariaJul29"]
+ROBOT_EXTRINSICS = EXTRINSICS["ariaSylvain"]
 from egomimic.scripts.masking.utils import SAM
 
 
