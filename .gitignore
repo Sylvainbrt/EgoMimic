@@ -1,4 +1,5 @@
 *.pth
+*.pt
 *.pyc
 egomimic.egg-info/
 *.hdf5

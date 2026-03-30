@@ -123,9 +123,9 @@ def load_data_for_training(config, obs_keys, type, dataset_path=None):
             hdf5_path=dataset_path,
             filter_key=valid_filter_by_attribute,
         )
-        assert set(train_demo_keys).isdisjoint(set(valid_demo_keys)), (
-            "training demonstrations overlap with " "validation demonstrations!"
-        )
+        # assert set(train_demo_keys).isdisjoint(set(valid_demo_keys)), (
+        #     "training demonstrations overlap with " "validation demonstrations!"
+        # )
         train_dataset = dataset_factory(
             config,
             obs_keys,

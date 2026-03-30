@@ -70,8 +70,8 @@
         ],
         "goal_mode": null,
         "cuda": true,
-        "batch_size": 16,
-        "num_epochs": 10000,
+        "batch_size": 8,
+        "num_epochs": 1000,
         "seed": 1
     },
     "algo": {

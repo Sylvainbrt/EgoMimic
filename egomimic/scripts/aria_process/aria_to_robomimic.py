@@ -116,13 +116,36 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     transform = slam_to_rgb(vrs_data_provider)
 
     for t in range(frame_length + 1):
-        # if t >= 2000:
-        #     break
-        if t + HORIZON * STEP < frame_length + 1:
-            if (t % 1000) == 0:
-                print(f"{t} frames ingested")
-            ## sampled image and camera pose at time t
-            sample_timestamp_ns_t: int = stream_timestamps_ns["rgb"][t]
+
+        if t + HORIZON * STEP >= frame_length + 1:
+            continue
+
+        if (t % 1000) == 0:
+            print(f"{t} frames ingested")
+
+        sample_timestamp_ns_t = stream_timestamps_ns["rgb"][t]
+
+        # Get wrist pose safely
+        wrist_and_palm_pose_t = mps_data_provider.get_wrist_and_palm_pose(
+            sample_timestamp_ns_t, time_query_closest
+        )
+
+        if wrist_and_palm_pose_t is None:
+            continue
+
+        # Check required hand presence
+        if hand == "right" and wrist_and_palm_pose_t.right_hand is None:
+            continue
+        if hand == "left" and wrist_and_palm_pose_t.left_hand is None:
+            continue
+        if hand == "bimanual" and (
+            wrist_and_palm_pose_t.left_hand is None
+            or wrist_and_palm_pose_t.right_hand is None
+        ):
+            continue
+
+        # Load RGB frame safely
+        try:
             sample_frames = {
                 key: provider.get_image_data_by_time_ns(
                     stream_id,
@@ -132,153 +155,137 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
                 )[0]
                 for key, stream_id in stream_ids.items()
             }
-            front_img_1_t = undistort_to_linear(
-                provider,
-                stream_ids,
-                raw_image=sample_frames["rgb"].to_numpy_array(),
-            )
-            ## obs ee_pose
-            wrist_and_palm_pose_t = mps_data_provider.get_wrist_and_palm_pose(
-                sample_timestamp_ns_t, time_query_closest
+        except:
+            continue
+
+        front_img_1_t = undistort_to_linear(
+            provider,
+            stream_ids,
+            raw_image=sample_frames["rgb"].to_numpy_array(),
+        )
+
+        rotation_matrix = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])
+
+        # ---- Compute ee_pose_obs_t safely ----
+        if hand == "right":
+            palm = wrist_and_palm_pose_t.right_hand.palm_position_device
+            ee = (transform @ palm).T
+            ee_pose_obs_t = np.dot(ee, rotation_matrix.T)
+            ac_dim = 3
+
+        elif hand == "left":
+            palm = wrist_and_palm_pose_t.left_hand.palm_position_device
+            ee = (transform @ palm).T
+            ee_pose_obs_t = np.dot(ee, rotation_matrix.T)
+            ac_dim = 3
+
+        else:  # bimanual
+            palm_l = wrist_and_palm_pose_t.left_hand.palm_position_device
+            palm_r = wrist_and_palm_pose_t.right_hand.palm_position_device
+
+            pose_l = np.dot((transform @ palm_l).T, rotation_matrix.T)
+            pose_r = np.dot((transform @ palm_r).T, rotation_matrix.T)
+
+            ee_pose_obs_t = np.concatenate((pose_l, pose_r), axis=None)
+            ac_dim = 6
+
+        actions_t = np.zeros((HORIZON, ac_dim))
+
+        # ---- Get camera frame at t ----
+        pose_t = mps_data_provider.get_closed_loop_pose(
+            sample_timestamp_ns_t, time_query_closest
+        )
+
+        if pose_t is None:
+            continue
+
+        camera_matrix = build_camera_matrix(vrs_data_provider, pose_t)
+        camera_t_inv = np.linalg.inv(camera_matrix)
+
+        valid_sample = True
+
+        # ---- Horizon rollout ----
+        for offset in range(HORIZON):
+
+            idx = int(t + offset * STEP)
+            sample_timestamp_ns = stream_timestamps_ns["rgb"][idx]
+
+            wrist_pose = mps_data_provider.get_wrist_and_palm_pose(
+                sample_timestamp_ns, time_query_closest
             )
 
-            rotation_matrix = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])
+            if wrist_pose is None:
+                valid_sample = False
+                break
+
+            pose_offset = mps_data_provider.get_closed_loop_pose(
+                sample_timestamp_ns, time_query_closest
+            )
+
+            if pose_offset is None:
+                valid_sample = False
+                break
+
+            camera_matrix_offset = build_camera_matrix(
+                vrs_data_provider, pose_offset
+            )
 
             if hand == "right":
-                ee_pose_obs_t_rot = (
-                    transform
-                    @ wrist_and_palm_pose_t.right_hand.palm_position_device
-                ).T
-                ee_pose_obs_t = np.dot(ee_pose_obs_t_rot, rotation_matrix.T)
-                actions_t = np.zeros((10, 3))
+                if wrist_pose.right_hand is None:
+                    valid_sample = False
+                    break
+                palm = wrist_pose.right_hand.palm_position_device
+                palm_cam = (transform @ palm).T
+
             elif hand == "left":
-                ee_pose_obs_t_rot = (
-                    transform @ wrist_and_palm_pose_t.left_hand.palm_position_device
-                ).T
-                ee_pose_obs_t = np.dot(ee_pose_obs_t_rot, rotation_matrix.T)
-                actions_t = np.zeros((10, 3))
-            elif hand == "bimanual":
-                pose_l = (
-                    transform @ wrist_and_palm_pose_t.left_hand.palm_position_device
-                ).T
-                pose_r = (
-                    transform
-                    @ wrist_and_palm_pose_t.right_hand.palm_position_device
-                ).T
+                if wrist_pose.left_hand is None:
+                    valid_sample = False
+                    break
+                palm = wrist_pose.left_hand.palm_position_device
+                palm_cam = (transform @ palm).T
 
-                pose_l_rot = np.dot(pose_l, rotation_matrix.T)
-                pose_r_rot = np.dot(pose_r, rotation_matrix.T)
+            else:  # bimanual
+                if wrist_pose.left_hand is None or wrist_pose.right_hand is None:
+                    valid_sample = False
+                    break
 
-                ee_pose_obs_t = np.concatenate(
-                    (pose_l_rot, pose_r_rot), axis=None
-                )  ## left, right -> [x, y, z, x, y, z]
-                actions_t = np.zeros((10, 6))
-            ## t to t + 9
+                palm_l = (transform @ wrist_pose.left_hand.palm_position_device).T
+                palm_r = (transform @ wrist_pose.right_hand.palm_position_device).T
 
-            # breakpoint()
-
-            pose_t = mps_data_provider.get_closed_loop_pose(
-                sample_timestamp_ns_t, time_query_closest
-            )
-
-            camera_matrix = build_camera_matrix(vrs_data_provider, pose_t)
-            camera_t_inv = np.linalg.inv(camera_matrix)
-
-            for offset in range(HORIZON):
-                sample_timestamp_ns = stream_timestamps_ns["rgb"][
-                    int(t + offset * STEP)
-                ]
-                wrist_and_palm_pose = mps_data_provider.get_wrist_and_palm_pose(
-                    sample_timestamp_ns, time_query_closest
-                )
-                ## LR pose at time t + offset in camera t + offset frame
-                right_palm = (
-                    transform @ wrist_and_palm_pose.right_hand.palm_position_device
-                ).T
-                left_palm = (
-                    transform @ wrist_and_palm_pose.left_hand.palm_position_device
-                ).T
-
-                pose_offset = mps_data_provider.get_closed_loop_pose(
-                    sample_timestamp_ns, time_query_closest
-                )
-                camera_matrix_offset = build_camera_matrix(
-                    vrs_data_provider, pose_offset
-                )
-
-                if hand == "right":
-                    if np.any(right_palm) or not np.all(right_palm == 0):
-                        right_palm_hom = np.append(right_palm, 1)
-                        hand_world = np.dot(
-                            camera_matrix_offset, right_palm_hom
-                        )  ## hand_pose[t + offset] in world frame
-                        hand_in_camera_t_frame = np.dot(
-                            camera_t_inv, hand_world
-                        )  ## hand_pose[t + offset] in camera t frame
-                        actions_t[offset] = hand_in_camera_t_frame[:3]
-                elif hand == "left":
-                    if np.any(left_palm) or not np.all(left_palm == 0):
-                        left_palm_hom = np.append(left_palm, 1)
-                        hand_world = np.dot(
-                            camera_matrix_offset, left_palm_hom
-                        )  ## hand_pose[t + offset] in world frame
-                        hand_in_camera_t_frame = np.dot(
-                            camera_t_inv, hand_world
-                        )  ## hand_pose[t + offset] in camera t frame
-                        actions_t[offset] = hand_in_camera_t_frame[:3]
-                elif hand == "bimanual":
-                    if (np.any(right_palm) or not np.all(right_palm == 0)) or (
-                        np.any(left_palm) or not np.all(left_palm == 0)
-                    ):
-                        ## right palm
-                        right_palm_hom = np.append(right_palm, 1)
-                        hand_world_r = np.dot(
-                            camera_matrix_offset, right_palm_hom
-                        )  ## right hand_pose[t + offset] in world frame
-                        hand_in_camera_t_frame_r = np.dot(
-                            camera_t_inv, hand_world_r
-                        )  ## right hand_pose[t + offset] in world frame
-
-                        ## left palm
-                        left_palm_hom = np.append(left_palm, 1)
-                        hand_world_l = np.dot(
-                            camera_matrix_offset, left_palm_hom
-                        )  ## left hand_pose[t + offset] in world frame
-                        hand_in_camera_t_frame_l = np.dot(
-                            camera_t_inv, hand_world_l
-                        )  ## left hand_pose[t + offset] in camera t frame
-                        actions_t[offset] = np.concatenate(
-                            (
-                                hand_in_camera_t_frame_l[:3],
-                                hand_in_camera_t_frame_r[:3],
-                            ),
-                            axis=None,
-                        )
-
-            if actions_t.shape == (10, 6):
-                # [x1 y1 z1 x2 y2 z2] -> [[x1 y1 z1], [x2 y2 z2]]
-                # actions_t_reshaped = actions_t.reshape(-1, 3)
-
-                # # apply rotation
-                # rotated_actions_t_reshaped = np.dot(actions_t_reshaped, rotation_matrix.T)
-
-                # # Reshape back to [x1 y1 z1 x2 y2 z2]
-                # rotated_actions_t = rotated_actions_t_reshaped.reshape(10, 6)
-                actions_t_l = actions_t[:, :3]
-                actions_t_r = actions_t[:, 3:]
-                actions_t_rot_l = np.dot(actions_t_l, rotation_matrix.T)
-                actions_t_rot_r = np.dot(actions_t_r, rotation_matrix.T)
-                rotated_actions_t = np.concatenate(
-                    (actions_t_rot_l, actions_t_rot_r), axis=1
-                )
-
+            # ---- Project to camera_t frame ----
+            if hand != "bimanual":
+                palm_hom = np.append(palm_cam, 1)
+                hand_world = np.dot(camera_matrix_offset, palm_hom)
+                hand_in_cam_t = np.dot(camera_t_inv, hand_world)
+                actions_t[offset] = hand_in_cam_t[:3]
             else:
-                rotated_actions_t = np.dot(actions_t, rotation_matrix.T)
+                palm_l_h = np.append(palm_l, 1)
+                palm_r_h = np.append(palm_r, 1)
 
-            if np.any(rotated_actions_t) or not np.all(rotated_actions_t == 0):
-                actions.append(rotated_actions_t.flatten())
-                front_img_1.append(front_img_1_t)
-                ee_pose.append(np.ravel(ee_pose_obs_t))
+                world_l = np.dot(camera_matrix_offset, palm_l_h)
+                world_r = np.dot(camera_matrix_offset, palm_r_h)
+
+                cam_l = np.dot(camera_t_inv, world_l)
+                cam_r = np.dot(camera_t_inv, world_r)
+
+                actions_t[offset] = np.concatenate(
+                    (cam_l[:3], cam_r[:3])
+                )
+
+        if not valid_sample:
+            continue
+
+        # Apply rotation
+        if ac_dim == 6:
+            actions_l = np.dot(actions_t[:, :3], rotation_matrix.T)
+            actions_r = np.dot(actions_t[:, 3:], rotation_matrix.T)
+            rotated_actions_t = np.concatenate((actions_l, actions_r), axis=1)
+        else:
+            rotated_actions_t = np.dot(actions_t, rotation_matrix.T)
+
+        actions.append(rotated_actions_t.flatten())
+        front_img_1.append(front_img_1_t)
+        ee_pose.append(np.ravel(ee_pose_obs_t))
 
 
     actions, front_img_1, ee_pose = (
