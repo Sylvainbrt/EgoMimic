@@ -207,6 +207,7 @@ class BaseConfig(Config):
         # in utils/dataset.py for more information.
         self.train.hdf5_normalize_obs = False
         self.train.hdf5_normalize_actions = False
+        self.train.imagenet_normalize_images = True
 
         # if provided, use the list of demo keys under the hdf5 group "mask/@hdf5_filter_key" for training, instead
         # of the full dataset. This provides a convenient way to train on only a subset of the trajectories in a dataset.

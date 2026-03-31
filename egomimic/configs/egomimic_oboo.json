@@ -72,7 +72,8 @@
         "cuda": true,
         "batch_size": 8,
         "num_epochs": 1000,
-        "seed": 1
+        "seed": 1,
+        "imagenet_normalize_images": true
     },
     "algo": {
         "optim_params": {
