@@ -8,7 +8,6 @@ Usage:
     python lerobot_sam_masking.py \
         --dataset /data/pick_sponge_robot.hdf5 \
         --sam \
-        [--inpaint] \
         [--debug]
 """
 
@@ -80,7 +79,7 @@ def sam_processing(dataset: str, debug: bool = False):
                     chunks=(1, H, W, 3),
                 )
                 obs.create_dataset(
-                    "front_img_1_line",
+                    "front_img_1_line", 
                     data=line_images,
                     chunks=(1, H, W, 3),
                 )
@@ -116,8 +115,5 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
-
-    if not args.sam and not args.inpaint:
-        parser.error("Specify at least one of --sam or --inpaint.")
 
     main(args)
