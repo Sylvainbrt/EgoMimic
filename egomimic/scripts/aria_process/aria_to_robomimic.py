@@ -13,6 +13,7 @@ from projectaria_tools.core.mps.utils import (
 from projectaria_tools.core.stream_id import StreamId
 import numpy as np
 import torch
+import cv2
 from tqdm import tqdm
 from typing import Dict, List, Optional
 
@@ -33,13 +34,15 @@ import json
 from egomimic.utils.egomimicUtils import (
     cam_frame_to_cam_pixels,
     WIDE_LENS_HAND_LEFT_K,
+    ARIA_INTRINSICS,
+    ARIA_WIDE_INTRINSICS,
     interpolate_keys,
     interpolate_arr
 )
 from egomimic.scripts.masking.utils import *
 
 HORIZON = 10
-STEP = 3.0
+STEP = 3
 
 
 """
@@ -52,35 +55,29 @@ python aria_to_robomimic.py --dataset /coc/flash7/datasets/egoplay/oboo_aria_apr
 
 def single_file_conversion(dataset, mps_sample_path, filename, hand):
     """
-    dataste: path to the dataset
+    dataset: path to the dataset
     mps_sample_path: path to the mps sample
     filename: name of the vrs file
     hand: left, right, bimanual
 
-    Returns: actions, front_img_1, ee_pose
+    Returns: actions [N, HORIZON, ac_dim], front_img_1 [N, H, W, 3], ee_pose [N, ac_dim]
     """
     vrsfile = os.path.join(dataset, filename)
 
-    # Hand tracking
+    # Hand tracking CSV (your recreated file)
     wrist_and_palm_poses_path = os.path.join(
         mps_sample_path, "hand_tracking", "wrist_and_palm_poses.csv"
     )
 
-    # Create data provider and get T_device_rgb
     provider = data_provider.create_vrs_data_provider(vrsfile)
 
-    ## Load hand tracking
-    wrist_and_palm_poses = mps.hand_tracking.read_wrist_and_palm_poses(
-        wrist_and_palm_poses_path
-    )
+    # Load hand tracking
+    _ = mps.hand_tracking.read_wrist_and_palm_poses(wrist_and_palm_poses_path)
 
-    # Get device calibration and transform from device to sensor
     device_calibration = provider.get_device_calibration()
-
     time_domain: TimeDomain = TimeDomain.DEVICE_TIME
     time_query_closest: TimeQueryOptions = TimeQueryOptions.CLOSEST
 
-    # Get stream ids, stream labels, stream timestamps, and camera calibrations for RGB and SLAM cameras
     stream_ids: Dict[str, StreamId] = {
         "rgb": StreamId("214-1"),
         "slam-left": StreamId("1201-1"),
@@ -94,247 +91,244 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
         key: provider.get_timestamps_ns(stream_id, time_domain)
         for key, stream_id in stream_ids.items()
     }
-    cam_calibrations = {
-        key: device_calibration.get_camera_calib(stream_label)
-        for key, stream_label in stream_labels.items()
-    }
-    for key, cam_calibration in cam_calibrations.items():
-        assert cam_calibration is not None, f"no camera calibration for {key}"
+
+    # Basic sanity
+    if len(stream_timestamps_ns["rgb"]) == 0:
+        return np.zeros((0, HORIZON, 3 if hand != "bimanual" else 6)), \
+               np.zeros((0, 1, 1, 3), dtype=np.uint8), \
+               np.zeros((0, 3 if hand != "bimanual" else 6))
+
+    vrs_data_provider = data_provider.create_vrs_data_provider(vrsfile)
 
     mps_data_paths_provider = mps.MpsDataPathsProvider(mps_sample_path)
     mps_data_paths = mps_data_paths_provider.get_data_paths()
     mps_data_provider = mps.MpsDataProvider(mps_data_paths)
 
-    frame_length = len(stream_timestamps_ns["rgb"]) - 1
-    print(frame_length)
-    actions = []
-    front_img_1 = []
-    ee_pose = []
-    ## get camera matrices
-    vrs_data_provider = data_provider.create_vrs_data_provider(vrsfile)
-
     transform = slam_to_rgb(vrs_data_provider)
 
-    for t in range(frame_length + 1):
+    frame_length = len(stream_timestamps_ns["rgb"])
+    print(f"Total RGB frames: {frame_length}")
 
-        if t + HORIZON * STEP >= frame_length + 1:
-            continue
+    actions_list = []
+    imgs_list = []
+    ee_pose_list = []
 
+    ac_dim = 3 if hand != "bimanual" else 6
+
+    for t in range(frame_length):
         if (t % 1000) == 0:
             print(f"{t} frames ingested")
 
         sample_timestamp_ns_t = stream_timestamps_ns["rgb"][t]
 
-        # Get wrist pose safely
-        wrist_and_palm_pose_t = mps_data_provider.get_wrist_and_palm_pose(
+        # Get wrist pose at reference time
+        wrist_t = mps_data_provider.get_wrist_and_palm_pose(
             sample_timestamp_ns_t, time_query_closest
         )
-
-        if wrist_and_palm_pose_t is None:
+        if wrist_t is None:
             continue
 
-        # Check required hand presence
-        if hand == "right" and wrist_and_palm_pose_t.right_hand is None:
-            continue
-        if hand == "left" and wrist_and_palm_pose_t.left_hand is None:
-            continue
-        if hand == "bimanual" and (
-            wrist_and_palm_pose_t.left_hand is None
-            or wrist_and_palm_pose_t.right_hand is None
-        ):
-            continue
+        # Require chosen hand at reference time
+        if hand == "right":
+            if wrist_t.right_hand is None:
+                continue
+        elif hand == "left":
+            if wrist_t.left_hand is None:
+                continue
+        else:  # bimanual: at least one hand at t
+            if (wrist_t.left_hand is None) and (wrist_t.right_hand is None):
+                continue
 
-        # Load RGB frame safely
+        # Load RGB frame; skip only this t if it fails
         try:
-            sample_frames = {
-                key: provider.get_image_data_by_time_ns(
-                    stream_id,
-                    sample_timestamp_ns_t,
-                    time_domain,
-                    time_query_closest,
-                )[0]
-                for key, stream_id in stream_ids.items()
-            }
-        except:
+            frame_rgb = provider.get_image_data_by_time_ns(
+                stream_ids["rgb"],
+                sample_timestamp_ns_t,
+                time_domain,
+                time_query_closest,
+            )[0]
+        except Exception:
             continue
 
-        front_img_1_t = undistort_to_linear(
+        img_t = undistort_to_linear(
             provider,
             stream_ids,
-            raw_image=sample_frames["rgb"].to_numpy_array(),
+            raw_image=frame_rgb.to_numpy_array(),
         )
 
-        rotation_matrix = np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]])
-
-        # ---- Compute ee_pose_obs_t safely ----
-        if hand == "right":
-            palm = wrist_and_palm_pose_t.right_hand.palm_position_device
-            ee = (transform @ palm).T
-            ee_pose_obs_t = np.dot(ee, rotation_matrix.T)
-            ac_dim = 3
-
-        elif hand == "left":
-            palm = wrist_and_palm_pose_t.left_hand.palm_position_device
-            ee = (transform @ palm).T
-            ee_pose_obs_t = np.dot(ee, rotation_matrix.T)
-            ac_dim = 3
-
-        else:  # bimanual
-            palm_l = wrist_and_palm_pose_t.left_hand.palm_position_device
-            palm_r = wrist_and_palm_pose_t.right_hand.palm_position_device
-
-            pose_l = np.dot((transform @ palm_l).T, rotation_matrix.T)
-            pose_r = np.dot((transform @ palm_r).T, rotation_matrix.T)
-
-            ee_pose_obs_t = np.concatenate((pose_l, pose_r), axis=None)
-            ac_dim = 6
-
-        actions_t = np.zeros((HORIZON, ac_dim))
-
-        # ---- Get camera frame at t ----
+        # Closed-loop pose at t (camera pose); if missing we cannot define camera frame
         pose_t = mps_data_provider.get_closed_loop_pose(
             sample_timestamp_ns_t, time_query_closest
         )
-
         if pose_t is None:
             continue
 
-        camera_matrix = build_camera_matrix(vrs_data_provider, pose_t)
-        camera_t_inv = np.linalg.inv(camera_matrix)
+        camera_matrix_t = build_camera_matrix(vrs_data_provider, pose_t)
+        camera_t_inv = np.linalg.inv(camera_matrix_t)
 
-        valid_sample = True
+        # Rotation to EgoMimic convention
+        rotation_matrix = np.array([[0, 1, 0],
+                                    [-1, 0, 0],
+                                    [0, 0, 1]])
 
-        # ---- Horizon rollout ----
+        # ee_pose at reference frame in camera_t
+        if hand == "right":
+            palm_dev = wrist_t.right_hand.palm_position_device
+            palm_cam = (transform @ palm_dev).T  # (1,3)
+            palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
+            palm_cam_t = (camera_t_inv @ palm_cam_h.T).T[0, :3]  # (3,)
+            ee_pose_obs_t = rotation_matrix @ palm_cam_t
+        elif hand == "left":
+            palm_dev = wrist_t.left_hand.palm_position_device
+            palm_cam = (transform @ palm_dev).T
+            palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
+            palm_cam_t = (camera_t_inv @ palm_cam_h.T).T[0, :3]
+            ee_pose_obs_t = rotation_matrix @ palm_cam_t
+        else:
+            ee_pose_obs_t = np.zeros(6, dtype=np.float32)
+            if wrist_t.left_hand is not None:
+                palm_l_dev = wrist_t.left_hand.palm_position_device
+                palm_l_cam = (transform @ palm_l_dev).T
+                palm_l_cam_h = np.concatenate([palm_l_cam, np.ones((1, 1))], axis=1)
+                palm_l_cam_t = (camera_t_inv @ palm_l_cam_h.T).T[0, :3]
+                ee_pose_obs_t[:3] = rotation_matrix @ palm_l_cam_t
+            if wrist_t.right_hand is not None:
+                palm_r_dev = wrist_t.right_hand.palm_position_device
+                palm_r_cam = (transform @ palm_r_dev).T
+                palm_r_cam_h = np.concatenate([palm_r_cam, np.ones((1, 1))], axis=1)
+                palm_r_cam_t = (camera_t_inv @ palm_r_cam_h.T).T[0, :3]
+                ee_pose_obs_t[3:] = rotation_matrix @ palm_r_cam_t
+
+        actions_t = np.zeros((HORIZON, ac_dim), dtype=np.float32)
+
+        # Horizon rollout: *never* drop whole sample, only leave zeros where missing
         for offset in range(HORIZON):
-
-            idx = int(t + offset * STEP)
-            sample_timestamp_ns = stream_timestamps_ns["rgb"][idx]
-
-            wrist_pose = mps_data_provider.get_wrist_and_palm_pose(
-                sample_timestamp_ns, time_query_closest
-            )
-
-            if wrist_pose is None:
-                valid_sample = False
+            idx = t + offset * STEP
+            if idx >= frame_length:
                 break
 
-            pose_offset = mps_data_provider.get_closed_loop_pose(
-                sample_timestamp_ns, time_query_closest
+            ts_ns = stream_timestamps_ns["rgb"][idx]
+            wrist_off = mps_data_provider.get_wrist_and_palm_pose(
+                ts_ns, time_query_closest
+            )
+            pose_off = mps_data_provider.get_closed_loop_pose(
+                ts_ns, time_query_closest
             )
 
-            if pose_offset is None:
-                valid_sample = False
-                break
+            if wrist_off is None or pose_off is None:
+                continue
 
-            camera_matrix_offset = build_camera_matrix(
-                vrs_data_provider, pose_offset
-            )
+            cam_mat_off = build_camera_matrix(vrs_data_provider, pose_off)
 
             if hand == "right":
-                if wrist_pose.right_hand is None:
-                    valid_sample = False
-                    break
-                palm = wrist_pose.right_hand.palm_position_device
-                palm_cam = (transform @ palm).T
-
+                if wrist_off.right_hand is None:
+                    continue
+                palm_dev = wrist_off.right_hand.palm_position_device
+                palm_cam = (transform @ palm_dev).T
+                palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
+                world = (cam_mat_off @ palm_cam_h.T).T  # (1,4)
+                palm_in_cam_t = (camera_t_inv @ world.T).T[0, :3]
+                actions_t[offset, :] = palm_in_cam_t
             elif hand == "left":
-                if wrist_pose.left_hand is None:
-                    valid_sample = False
-                    break
-                palm = wrist_pose.left_hand.palm_position_device
-                palm_cam = (transform @ palm).T
-
+                if wrist_off.left_hand is None:
+                    continue
+                palm_dev = wrist_off.left_hand.palm_position_device
+                palm_cam = (transform @ palm_dev).T
+                palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
+                world = (cam_mat_off @ palm_cam_h.T).T
+                palm_in_cam_t = (camera_t_inv @ world.T).T[0, :3]
+                actions_t[offset, :] = palm_in_cam_t
             else:  # bimanual
-                if wrist_pose.left_hand is None or wrist_pose.right_hand is None:
-                    valid_sample = False
-                    break
+                have_l = wrist_off.left_hand is not None
+                have_r = wrist_off.right_hand is not None
+                if not (have_l or have_r):
+                    continue
 
-                palm_l = (transform @ wrist_pose.left_hand.palm_position_device).T
-                palm_r = (transform @ wrist_pose.right_hand.palm_position_device).T
+                if have_l:
+                    palm_l_dev = wrist_off.left_hand.palm_position_device
+                    palm_l_cam = (transform @ palm_l_dev).T
+                    palm_l_cam_h = np.concatenate(
+                        [palm_l_cam, np.ones((1, 1))], axis=1
+                    )
+                    world_l = (cam_mat_off @ palm_l_cam_h.T).T
+                    cam_l_t = (camera_t_inv @ world_l.T).T[0, :3]
+                else:
+                    cam_l_t = np.zeros(3, dtype=np.float32)
 
-            # ---- Project to camera_t frame ----
-            if hand != "bimanual":
-                palm_hom = np.append(palm_cam, 1)
-                hand_world = np.dot(camera_matrix_offset, palm_hom)
-                hand_in_cam_t = np.dot(camera_t_inv, hand_world)
-                actions_t[offset] = hand_in_cam_t[:3]
-            else:
-                palm_l_h = np.append(palm_l, 1)
-                palm_r_h = np.append(palm_r, 1)
+                if have_r:
+                    palm_r_dev = wrist_off.right_hand.palm_position_device
+                    palm_r_cam = (transform @ palm_r_dev).T
+                    palm_r_cam_h = np.concatenate(
+                        [palm_r_cam, np.ones((1, 1))], axis=1
+                    )
+                    world_r = (cam_mat_off @ palm_r_cam_h.T).T
+                    cam_r_t = (camera_t_inv @ world_r.T).T[0, :3]
+                else:
+                    cam_r_t = np.zeros(3, dtype=np.float32)
 
-                world_l = np.dot(camera_matrix_offset, palm_l_h)
-                world_r = np.dot(camera_matrix_offset, palm_r_h)
+                actions_t[offset, :] = np.concatenate([cam_l_t, cam_r_t], axis=0)
 
-                cam_l = np.dot(camera_t_inv, world_l)
-                cam_r = np.dot(camera_t_inv, world_r)
-
-                actions_t[offset] = np.concatenate(
-                    (cam_l[:3], cam_r[:3])
-                )
-
-        if not valid_sample:
-            continue
-
-        # Apply rotation
-        if ac_dim == 6:
-            actions_l = np.dot(actions_t[:, :3], rotation_matrix.T)
-            actions_r = np.dot(actions_t[:, 3:], rotation_matrix.T)
-            rotated_actions_t = np.concatenate((actions_l, actions_r), axis=1)
+        # Rotate actions to EgoMimic convention
+        if ac_dim == 3:
+            rotated_actions_t = (rotation_matrix @ actions_t.T).T
         else:
-            rotated_actions_t = np.dot(actions_t, rotation_matrix.T)
+            rotated_actions_t = actions_t.copy()
+            rotated_actions_t[:, :3] = (rotation_matrix @ actions_t[:, :3].T).T
+            rotated_actions_t[:, 3:] = (rotation_matrix @ actions_t[:, 3:].T).T
 
-        actions.append(rotated_actions_t.flatten())
-        front_img_1.append(front_img_1_t)
-        ee_pose.append(np.ravel(ee_pose_obs_t))
+        actions_list.append(rotated_actions_t)
+        imgs_list.append(img_t)
+        ee_pose_list.append(ee_pose_obs_t)
 
+    if len(actions_list) == 0:
+        return np.zeros((0, HORIZON, ac_dim)), \
+               np.zeros((0, 1, 1, 3), dtype=np.uint8), \
+               np.zeros((0, ac_dim))
 
-    actions, front_img_1, ee_pose = (
-        np.array(actions),
-        np.array(front_img_1),
-        np.array(ee_pose),
-    )
+    actions = np.stack(actions_list, axis=0)
+    front_img_1 = np.stack(imgs_list, axis=0)
+    ee_pose = np.stack(ee_pose_list, axis=0)
 
-    ac_dim = actions_t.shape[-1]
-    actions_flat = actions.copy().reshape((-1, 3))
+    # Filter by FOV / jumps (same as before, but no additional frame skipping)
+    ac_dim = actions.shape[-1]
+    actions_flat = actions.reshape((-1, 3))
     px = cam_frame_to_cam_pixels(
-        transform_actions(actions_flat), WIDE_LENS_HAND_LEFT_K
+        transform_actions(actions_flat), ARIA_INTRINSICS
     )
     px = px.reshape((-1, HORIZON, ac_dim))
-    if ac_dim == 3:
-        bad_data_mask = (
-            (px[:, :, 0] < 0)
-            | (px[:, :, 0] > 640)
-            | (px[:, :, 1] < 0)
-            | (px[:, :, 1] > 480)
-        )
-    elif ac_dim == 6:
-        BUFFER = 0
-        bad_data_mask = (
-            (px[:, :, 0] < 0 - BUFFER)
-            | (px[:, :, 0] > 640 + BUFFER)
-            | (px[:, :, 1] < 0)
-            # | (px[:, :, 1] > 480 + BUFFER)
-            | (px[:, :, 3] < 0 - BUFFER)
-            | (px[:, :, 3] > 640 + BUFFER)
-            | (px[:, :, 4] < 0)
-            # | (px[:, :, 4] > 480 + BUFFER)
-        )
 
-        px_diff = np.diff(px, axis=1)
-        px_diff = np.concatenate((
-            px_diff, 
-            np.zeros((px_diff.shape[0], 1, px_diff.shape[-1]))
-        ), axis=1)
-        px_diff = np.abs(px_diff)
-        bad_data_mask = bad_data_mask | np.any(px_diff > 100, axis=2)
+    # if ac_dim == 3:
+    #     bad_data_mask = (
+    #         (px[:, :, 0] < -50)
+    #         | (px[:, :, 0] > 690)
+    #         | (px[:, :, 1] < -50)
+    #         | (px[:, :, 1] > 530)
+    #     )
+    # else:  # 6
+    #     BUFFER = 0
+    #     bad_data_mask = (
+    #         (px[:, :, 0] < 0 - BUFFER)
+    #         | (px[:, :, 0] > 640 + BUFFER)
+    #         | (px[:, :, 1] < 0)
+    #         | (px[:, :, 3] < 0 - BUFFER)
+    #         | (px[:, :, 3] > 640 + BUFFER)
+    #         | (px[:, :, 4] < 0)
+    #     )
+    #     px_diff = np.diff(px, axis=1)
+    #     px_diff = np.concatenate(
+    #         (px_diff, np.zeros((px_diff.shape[0], 1, px_diff.shape[-1]))),
+    #         axis=1,
+    #     )
+    #     px_diff = np.abs(px_diff)
+    #     bad_data_mask = bad_data_mask | np.any(px_diff > 100, axis=2)
 
-    bad_data_mask = np.any(bad_data_mask, axis=1)
+    # bad_data_mask = np.any(bad_data_mask, axis=1)
 
-    actions = actions[~bad_data_mask]
-    front_img_1 = front_img_1[~bad_data_mask]
-    ee_pose = ee_pose[~bad_data_mask]
+    # actions = actions[~bad_data_mask]
+    # front_img_1 = front_img_1[~bad_data_mask]
+    # ee_pose = ee_pose[~bad_data_mask]
 
-    return np.array(actions), np.array(front_img_1), np.array(ee_pose)
+    return actions, front_img_1, ee_pose
 
 def transform_ee_pose(ee_pose):
     if ee_pose.shape[1] == 3:
@@ -434,6 +428,54 @@ def line_on_hand(images, masks, arm):
     
     return overlayed_imgs
 
+def project_ee_to_pixels(ee_pose):
+    """
+    Project ee_pose (N,3) or (N,6) assumed to be in camera frame
+    into pixel coordinates using ARIA_INTRINSICS.
+
+    Returns: px (N,2) if 3D, or (N,4) if 6D (two points).
+    """
+    if ee_pose.shape[1] == 3:
+        pts = ee_pose
+        px = cam_frame_to_cam_pixels(pts, ARIA_INTRINSICS)  # (N,3) → (N,2)
+        return px  # (N,2)
+
+    elif ee_pose.shape[1] == 6:
+        # two 3D points [x_l,y_l,z_l,x_r,y_r,z_r]
+        left = ee_pose[:, :3]
+        right = ee_pose[:, 3:6]
+        px_l = cam_frame_to_cam_pixels(left, ARIA_INTRINSICS)   # (N,2)
+        px_r = cam_frame_to_cam_pixels(right, ARIA_INTRINSICS)  # (N,2)
+        # concat as [u_l, v_l, u_r, v_r]
+        return np.concatenate([px_l, px_r], axis=1)  # (N,4)
+
+    else:
+        # Unsupported dim: return zeros to be safe
+        return np.zeros((ee_pose.shape[0], 2), dtype=np.float32)
+
+def draw_ee_on_images(images, ee_pose_px):
+    """
+    images: (N, H, W, 3), uint8
+    ee_pose_px: (N,2) or (N,4)
+    Returns: (N, H, W, 3) with circles drawn at projected ee positions.
+    """
+    out = images.copy()
+    N = images.shape[0]
+    for i in range(N):
+        img = out[i]
+        pts = ee_pose_px[i]
+        if pts.shape[0] == 2:  # single point
+            u, v = int(pts[0]), int(pts[1])
+            if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
+                cv2.circle(img, (u, v), 80, (0, 255, 0), -1)
+        elif pts.shape[0] == 4:  # two points [u_l, v_l, u_r, v_r]
+            u_l, v_l, u_r, v_r = map(int, pts)
+            if 0 <= u_l < img.shape[1] and 0 <= v_l < img.shape[0]:
+                cv2.circle(img, (u_l, v_l), 80, (0, 255, 0), -1)
+            if 0 <= u_r < img.shape[1] and 0 <= v_r < img.shape[0]:
+                cv2.circle(img, (u_r, v_r), 80, (0, 0, 255), -1)
+        out[i] = img
+    return out
 
 def sam_processing(dataset, debug=False):
     """
@@ -442,7 +484,6 @@ def sam_processing(dataset, debug=False):
     dataset: path to the hdf5 file
     """
     if torch.cuda.get_device_properties(0).major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
@@ -452,24 +493,51 @@ def sam_processing(dataset, debug=False):
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             for i in tqdm(range(len(data["data"].keys()))):
                 demo = data[f"data/demo_{i}"]
-                imgs = demo["obs/front_img_1"]
-                ee_poses = demo["obs/ee_pose"]
+                imgs = demo["obs/front_img_1"][:]
+                ee_poses = demo["obs/ee_pose"][:]
 
-                overlayed_imgs, masked_imgs, raw_masks = sam.get_hand_mask_line_batched(imgs, ee_poses, ARIA_INTRINSICS, debug=debug)
-                
+                # Detect invalid ee_poses: NaN or all zeros
+                invalid = np.isnan(ee_poses).any(axis=1) | (np.linalg.norm(ee_poses, axis=1) == 0)
+                if invalid.all():
+                    # all invalid -> null masks
+                    H, W = imgs.shape[1], imgs.shape[2]
+                    raw_masks = np.zeros((imgs.shape[0], H, W), dtype=bool)
+                    masked_imgs = imgs
+                    overlayed_imgs = imgs
+                else:
+                    try:
+                        overlayed_imgs, masked_imgs, raw_masks = sam.get_hand_mask_line_batched(
+                            imgs, ee_poses, ARIA_INTRINSICS, debug=debug
+                        )
+                    except Exception:
+                        H, W = imgs.shape[1], imgs.shape[2]
+                        raw_masks = np.zeros((imgs.shape[0], H, W), dtype=bool)
+                        masked_imgs = imgs
+                        overlayed_imgs = imgs
+
                 if "front_img_1_masked" in demo["obs"]:
-                    print("Deleting existing masked images")
                     del demo["obs/front_img_1_masked"]
                 if "front_img_1_line" in demo["obs"]:
-                    print("Deleting existing line images")
                     del demo["obs/front_img_1_line"]
                 if "front_img_1_mask" in demo["obs"]:
-                    print("Deleting existing masks")
                     del demo["obs/front_img_1_mask"]
 
-                demo["obs"].create_dataset("front_img_1_masked", data=masked_imgs, chunks=(1, 480, 640, 3))
-                demo["obs"].create_dataset("front_img_1_mask", data=raw_masks, chunks=(1, 480, 640), dtype=bool)
-                demo["obs"].create_dataset("front_img_1_line", data=overlayed_imgs, chunks=(1, 480, 640, 3))
+                demo["obs"].create_dataset(
+                    "front_img_1_masked",
+                    data=masked_imgs,
+                    chunks=(1, 480, 640, 3),
+                )
+                demo["obs"].create_dataset(
+                    "front_img_1_mask",
+                    data=raw_masks,
+                    chunks=(1, 480, 640),
+                    dtype=bool,
+                )
+                demo["obs"].create_dataset(
+                    "front_img_1_line",
+                    data=overlayed_imgs,
+                    chunks=(1, 480, 640, 3),
+                )
 
 
 def main(args):
@@ -498,10 +566,12 @@ def main(args):
             actions, front_img_1, ee_pose = single_file_conversion(
                 args.dataset, mps_paths[j], filename, args.hand
             )
-            actions, ee_pose = transform_actions(actions), transform_ee_pose(ee_pose)
+            # actions, ee_pose = transform_actions(actions), transform_ee_pose(ee_pose)
+            actions, ee_pose = actions, ee_pose
+            ee_pose_px = project_ee_to_pixels(ee_pose)
             N = actions.shape[0]
             print(f"{N} frames in vrs file")
-            chunk_size = 300  # Define chunk size
+            chunk_size = 30  # Define chunk size
             for i in range(0, N, chunk_size):
                 # print(i)
                 group = data.create_group(f"demo_{demo_index}")
@@ -520,6 +590,11 @@ def main(args):
                     "obs/front_img_1", data=front_img_1[i : i + chunk_size]
                 )
                 group.create_dataset("obs/ee_pose", data=ee_pose[i : i + chunk_size])
+                group.create_dataset(
+                    "obs/ee_pose_px", data=ee_pose_px[i : i + chunk_size]
+                )
+                debug_imgs = draw_ee_on_images(front_img_1[i : i + chunk_size], ee_pose_px[i : i + chunk_size])
+                group.create_dataset("obs/front_img_1_ee_debug", data=debug_imgs)
                 demo_index += 1
             print(f"Completed adding {filename}")
             # break
@@ -566,9 +641,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    assert (
-        args.hand is not None or not "left" or not "right" or not "bimanual"
-    ), "Must provide the correct key (left, right, bimanual)"
+    assert args.hand in ["left", "right", "bimanual"], "Must provide the correct key (left, right, bimanual)"
     assert args.dataset is not None, "Must provide correct dataset folder"
     assert args.out is not None, "Must provide output file path"
 

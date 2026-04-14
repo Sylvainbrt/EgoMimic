@@ -75,3 +75,4 @@ This will process your aria data into hdf5 format, and optionally with the `--ma
 cd egomimic
 python scripts/aria_process/aria_to_robomimic.py --dataset /path/to/TASK_NAME_ARIA --out /path/to/converted/TASK_NAME.hdf5 --hand <left, right, or bimanual> --mask
 ```
+python scripts/aria_process/aria_to_robomimic.py --dataset /data/sybeuret/remote_aria_data/egomimic_process/raw --out /data/sybeuret/remote_aria_data/egomimic_process/converted/pick_and_place_2.hdf5 --hand right --mask

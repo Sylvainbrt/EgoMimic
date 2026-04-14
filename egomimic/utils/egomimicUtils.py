@@ -23,6 +23,14 @@ ARIA_INTRINSICS = np.array(
     ]
 )
 
+ARIA_WIDE_INTRINSICS = np.array(
+    [
+        [1218.12635, 0.0, 1460.72, 0],
+        [0.0, 1218.12635, 1447.61, 0],
+        [0.0, 0.0, 1.0, 0],
+    ]
+)
+
 # A2 paper without turning in skew direction
 WIDE_LENS_ROBOT_LEFT_K = np.array(
     [
