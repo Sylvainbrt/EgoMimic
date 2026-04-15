@@ -75,7 +75,7 @@ def main():
 
     if args.debug:
         import os
-        os.makedirs("calibration_imgs", exist_ok=True)
+        os.makedirs("calibration_imgs_3", exist_ok=True)
 
     R_base2gripper_list = []
     t_base2gripper_list = []
@@ -111,19 +111,11 @@ def main():
             if len(detect_result) != 1:
                 print(f"wrong detection, skipping img {t}")
                 if args.debug:
-                    plt.imsave(f"calibration_imgs/{t}_fail.png", img)
+                    plt.imsave(f"calibration_imgs_3/{t}_fail.png", img)
 
                 continue
 
-            bounding_box_corners = detect_result[0].corners
-            # draw bounding box on img and save
-            if args.debug:
-                # pupil-apriltags doesn't have vis_tag, draw corners manually if needed
-                for j in range(4):
-                    pt1 = (int(bounding_box_corners[j][0]), int(bounding_box_corners[j][1]))
-                    pt2 = (int(bounding_box_corners[(j + 1) % 4][0]), int(bounding_box_corners[(j + 1) % 4][1]))
-                    cv2.line(img, pt1, pt2, (0, 255, 0), 2)
-                plt.imsave(f"calibration_imgs/{t}_detection.png", img)
+
 
             count += 1
             print(list(demo["obs"].keys()))
@@ -141,6 +133,22 @@ def main():
 
             R_target2cam_list.append(detect_result[0].pose_R)
             pose_t = detect_result[0].pose_t
+
+
+            bounding_box_corners = detect_result[0].corners
+            # draw bounding box on img and save
+            if args.debug:
+                # pupil-apriltags doesn't have vis_tag, draw corners manually if needed
+                for j in range(4):
+                    pt1 = (int(bounding_box_corners[j][0]), int(bounding_box_corners[j][1]))
+                    pt2 = (int(bounding_box_corners[(j + 1) % 4][0]), int(bounding_box_corners[(j + 1) % 4][1]))
+                    cv2.line(img, pt1, pt2, (0, 255, 0), 2)
+                    # reproject the tag center and draw it
+                    tag_px = ARIA_INTRINSICS @ np.append(pose_t, 1.0)
+                    tag_px = tag_px / tag_px[2]
+                    tag_px = (int(tag_px[0]), int(tag_px[1]))
+                    cv2.circle(img, tag_px, 5, (255, 0, 0), -1)
+                plt.imsave(f"calibration_imgs_3/{t}_detection.png", img)
 
             # if args.debug:
             #     print("Detected: ", pose_t, T.quat2axisangle(T.mat2quat(detect_result[0].pose_R)))

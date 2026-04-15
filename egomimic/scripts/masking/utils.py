@@ -134,13 +134,13 @@ class SAM:
         self.predictor = predictor
         self.fk = AlohaFK()
     
-    def get_robot_mask_line_batched_from_qpos(self, images, qpos, extrinsics, intrinsics, arm="right"):
+    def get_robot_mask_line_batched_from_qpos(self, images, qpos, extrinsics, intrinsics, arm="right", debug=False):
         """
             images: tensor (B, H, W, 3)
             qpos: B, 7
         """
         px_dict = self.project_joint_positions_to_image(qpos, extrinsics, intrinsics, arm=arm)
-        mask_images, line_images =  self.get_robot_mask_line_batched(images, px_dict, arm=arm)
+        mask_images, line_images =  self.get_robot_mask_line_batched(images, px_dict, arm=arm, debug=debug)
         return mask_images, line_images
     
     def get_hand_mask_line_batched(self, imgs, ee_poses, intrinsics, debug=False):
@@ -333,7 +333,7 @@ class SAM:
         else:
             raise ValueError("Arm must be 'both, 'right' or 'left'")
 
-    def get_robot_mask_line_batched(self, images, px_dict, arm="right"):
+    def get_robot_mask_line_batched(self, images, px_dict, arm="right", debug=False):
         line_images = np.zeros_like(images)
         mask_images = np.zeros_like(images)
 
@@ -410,7 +410,7 @@ class SAM:
                     (int(px_dict["px_val_gripper_left"][i, 0]), int(px_dict["px_val_gripper_left"][i, 1])),
                     (int(px_dict["px_val_elbow_left"][i, 0]), int(px_dict["px_val_elbow_left"][i, 1])),
                     color=(255, 0, 0),
-                    thickness=25
+                    thickness=2
                 )
             if arm == "both" or arm == "right":
                 ## draw right line
@@ -419,9 +419,13 @@ class SAM:
                     (int(px_dict["px_val_gripper_right"][i, 0]), int(px_dict["px_val_gripper_right"][i, 1])),
                     (int(px_dict["px_val_elbow_right"][i, 0]), int(px_dict["px_val_elbow_right"][i, 1])),
                     color=(255, 0, 0),
-                    thickness=25
+                    thickness=2
                 )
 
+            if debug:
+                # Draw the input points SAM is using to test calibration
+                for pt in input_point:
+                    cv2.circle(line_img, (int(pt[0]), int(pt[1])), 10, (255, 0, 0), -1)
 
             mask_images[i] = masked_img
             line_images[i] = line_img

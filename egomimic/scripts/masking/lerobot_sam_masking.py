@@ -45,7 +45,7 @@ def sam_processing(dataset: str, debug: bool = False):
         demo_keys = sorted(data["data"].keys(), key=lambda k: int(k.split("_")[1]))
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-            for demo_key in tqdm(demo_keys, desc="SAM masking"):
+            for demo_key in tqdm(demo_keys[:1], desc="SAM masking"):
                 demo = data[f"data/{demo_key}"]
 
                 if "obs/front_img_1" not in demo:
@@ -62,7 +62,7 @@ def sam_processing(dataset: str, debug: bool = False):
                 qpos       = obs["joint_positions"][:]    # (T, 7)
 
                 mask_images, line_images = sam.get_robot_mask_line_batched_from_qpos(
-                    imgs, qpos, ROBOT_EXTRINSICS, ARIA_INTRINSICS, arm="right"
+                    imgs, qpos, ROBOT_EXTRINSICS, ARIA_INTRINSICS, arm="right", debug=debug
                 )
 
                 
