@@ -179,13 +179,19 @@ def cam_frame_to_cam_pixels(ee_pose_cam, intrinsics):
     ee_pose_cam: (N, 3)
     intrinsics: 3x4 matrix
     """
+    # Force the shape to exactly 2D to fix "too many values to unpack" errors
+    ee_pose_cam = ee_pose_cam.reshape(ee_pose_cam.shape[0], -1)
     N, _ = ee_pose_cam.shape
     ee_pose_cam = np.concatenate([ee_pose_cam, np.ones((N, 1))], axis=1)
     # print("3d pos in cam frame: ", ee_pose_cam)
 
     # print("intrinsics: ", intrinsics.shape, ee_pose_cam.shape)
     px_val = intrinsics @ ee_pose_cam.T
-    px_val = px_val / px_val[2, :]
+    
+    # Safely handle potential division by zero
+    z_vals = px_val[2, :]
+    z_vals[z_vals == 0] = 1e-6
+    px_val = px_val / z_vals
     # print("2d pos cam frame: ", px_val)
 
     return px_val.T

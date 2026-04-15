@@ -78,6 +78,8 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     time_domain: TimeDomain = TimeDomain.DEVICE_TIME
     time_query_closest: TimeQueryOptions = TimeQueryOptions.CLOSEST
 
+
+
     stream_ids: Dict[str, StreamId] = {
         "rgb": StreamId("214-1"),
         "slam-left": StreamId("1201-1"),
@@ -106,6 +108,12 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
 
     transform = slam_to_rgb(vrs_data_provider)
 
+    # Extract T_device_rgb_camera outside your loop
+    device_calibration = vrs_data_provider.get_device_calibration()
+    rgb_calib = device_calibration.get_camera_calib(stream_labels["rgb"])
+    T_device_rgb_camera = rgb_calib.get_transform_device_camera()
+    T_rgb_camera_device = T_device_rgb_camera.inverse()
+
     frame_length = len(stream_timestamps_ns["rgb"])
     print(f"Total RGB frames: {frame_length}")
 
@@ -114,6 +122,9 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     ee_pose_list = []
 
     ac_dim = 3 if hand != "bimanual" else 6
+
+    center_px_test = ARIA_INTRINSICS @ np.array([0, 0, 1, 1])
+    print(f"Optical center should be at: {center_px_test[:2]}")
 
     for t in range(frame_length):
         if (t % 1000) == 0:
@@ -167,36 +178,33 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
         camera_t_inv = np.linalg.inv(camera_matrix_t)
 
         # Rotation to EgoMimic convention
-        rotation_matrix = np.array([[0, 1, 0],
-                                    [-1, 0, 0],
+        rotation_matrix = np.array([[0, -1, 0],
+                                    [1, 0, 0],
                                     [0, 0, 1]])
+
+
 
         # ee_pose at reference frame in camera_t
         if hand == "right":
             palm_dev = wrist_t.right_hand.palm_position_device
-            palm_cam = (transform @ palm_dev).T  # (1,3)
-            palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
-            palm_cam_t = (camera_t_inv @ palm_cam_h.T).T[0, :3]  # (3,)
+            # Ensure the evaluated 3D point strictly has shape (3,)
+            palm_cam_t = np.array(T_rgb_camera_device @ palm_dev).flatten()
+
+            # Rotate to EgoMimic convention
             ee_pose_obs_t = rotation_matrix @ palm_cam_t
         elif hand == "left":
             palm_dev = wrist_t.left_hand.palm_position_device
-            palm_cam = (transform @ palm_dev).T
-            palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
-            palm_cam_t = (camera_t_inv @ palm_cam_h.T).T[0, :3]
+            palm_cam_t = np.array(T_rgb_camera_device @ palm_dev).flatten()
             ee_pose_obs_t = rotation_matrix @ palm_cam_t
         else:
             ee_pose_obs_t = np.zeros(6, dtype=np.float32)
             if wrist_t.left_hand is not None:
                 palm_l_dev = wrist_t.left_hand.palm_position_device
-                palm_l_cam = (transform @ palm_l_dev).T
-                palm_l_cam_h = np.concatenate([palm_l_cam, np.ones((1, 1))], axis=1)
-                palm_l_cam_t = (camera_t_inv @ palm_l_cam_h.T).T[0, :3]
+                palm_l_cam_t = np.array(T_rgb_camera_device @ palm_l_dev).flatten()
                 ee_pose_obs_t[:3] = rotation_matrix @ palm_l_cam_t
             if wrist_t.right_hand is not None:
                 palm_r_dev = wrist_t.right_hand.palm_position_device
-                palm_r_cam = (transform @ palm_r_dev).T
-                palm_r_cam_h = np.concatenate([palm_r_cam, np.ones((1, 1))], axis=1)
-                palm_r_cam_t = (camera_t_inv @ palm_r_cam_h.T).T[0, :3]
+                palm_r_cam_t = np.array(T_rgb_camera_device @ palm_r_dev).flatten()
                 ee_pose_obs_t[3:] = rotation_matrix @ palm_r_cam_t
 
         actions_t = np.zeros((HORIZON, ac_dim), dtype=np.float32)
@@ -433,48 +441,64 @@ def project_ee_to_pixels(ee_pose):
     Project ee_pose (N,3) or (N,6) assumed to be in camera frame
     into pixel coordinates using ARIA_INTRINSICS.
 
-    Returns: px (N,2) if 3D, or (N,4) if 6D (two points).
+    Returns:
+      (N,2) if ee_pose is (N,3): [u, v]
+      (N,4) if ee_pose is (N,6): [u_l, v_l, u_r, v_r]
     """
-    if ee_pose.shape[1] == 3:
-        pts = ee_pose
-        px = cam_frame_to_cam_pixels(pts, ARIA_INTRINSICS)  # (N,3) → (N,2)
-        return px  # (N,2)
+    if ee_pose.size == 0:
+        return ee_pose
 
-    elif ee_pose.shape[1] == 6:
-        # two 3D points [x_l,y_l,z_l,x_r,y_r,z_r]
+    if ee_pose.shape[1] == 3:
+        # (N,3) -> (N,2)
+        px = cam_frame_to_cam_pixels(ee_pose, ARIA_INTRINSICS)  # expects (N,3)
+        return px.astype(np.int32)
+
+    if ee_pose.shape[1] == 6:
         left = ee_pose[:, :3]
         right = ee_pose[:, 3:6]
         px_l = cam_frame_to_cam_pixels(left, ARIA_INTRINSICS)   # (N,2)
         px_r = cam_frame_to_cam_pixels(right, ARIA_INTRINSICS)  # (N,2)
-        # concat as [u_l, v_l, u_r, v_r]
-        return np.concatenate([px_l, px_r], axis=1)  # (N,4)
+        px = np.concatenate([px_l, px_r], axis=1)               # (N,4)
+        return px.astype(np.int32)
 
-    else:
-        # Unsupported dim: return zeros to be safe
-        return np.zeros((ee_pose.shape[0], 2), dtype=np.float32)
+    # Fallback
+    return np.zeros((ee_pose.shape[0], 2), dtype=np.int32)
 
 def draw_ee_on_images(images, ee_pose_px):
     """
     images: (N, H, W, 3), uint8
-    ee_pose_px: (N,2) or (N,4)
-    Returns: (N, H, W, 3) with circles drawn at projected ee positions.
+    ee_pose_px: (N,2) or (N,4), float
+    Returns: (N, H, W, 3) with points drawn.
     """
     out = images.copy()
     N = images.shape[0]
+    H, W = images.shape[1], images.shape[2]
+
     for i in range(N):
         img = out[i]
         pts = ee_pose_px[i]
-        if pts.shape[0] == 2:  # single point
-            u, v = int(pts[0]), int(pts[1])
-            if 0 <= u < img.shape[1] and 0 <= v < img.shape[0]:
-                cv2.circle(img, (u, v), 80, (0, 255, 0), -1)
-        elif pts.shape[0] == 4:  # two points [u_l, v_l, u_r, v_r]
-            u_l, v_l, u_r, v_r = map(int, pts)
-            if 0 <= u_l < img.shape[1] and 0 <= v_l < img.shape[0]:
-                cv2.circle(img, (u_l, v_l), 80, (0, 255, 0), -1)
-            if 0 <= u_r < img.shape[1] and 0 <= v_r < img.shape[0]:
-                cv2.circle(img, (u_r, v_r), 80, (0, 0, 255), -1)
+
+        if pts.shape[0] == 2 or pts.shape[0] == 3:  # [u, v]
+            u, v = int(round(pts[0])), int(round(pts[1]))
+            if 0 <= u < W and 0 <= v < H:
+                cv2.circle(img, (u, v), 6, (0, 255, 0), -1)
+
+        elif pts.shape[0] == 4:  # [u_l, v_l, u_r, v_r]
+            u_l, v_l, u_r, v_r = map(lambda x: int(round(x)), pts)
+            if 0 <= u_l < W and 0 <= v_l < H:
+                cv2.circle(img, (u_l, v_l), 6, (0, 255, 0), -1)
+            if 0 <= u_r < W and 0 <= v_r < H:
+                cv2.circle(img, (u_r, v_r), 6, (0, 0, 255), -1)
+
+        elif pts.shape[0] == 6:
+            u_l, v_l, _, u_r, v_r, _ = map(lambda x: int(round(x)), pts)
+            if 0 <= u_l < W and 0 <= v_l < H:
+                cv2.circle(img, (u_l, v_l), 6, (0, 255, 0), -1)
+            if 0 <= u_r < W and 0 <= v_r < H:
+                cv2.circle(img, (u_r, v_r), 6, (0, 0, 255), -1)
+
         out[i] = img
+
     return out
 
 def sam_processing(dataset, debug=False):
@@ -495,12 +519,25 @@ def sam_processing(dataset, debug=False):
                 demo = data[f"data/demo_{i}"]
                 imgs = demo["obs/front_img_1"][:]
                 ee_poses = demo["obs/ee_pose"][:]
+                H, W = imgs.shape[1], imgs.shape[2]
 
-                # Detect invalid ee_poses: NaN or all zeros
+                # 1. Detect invalid ee_poses: NaN or all zeros
                 invalid = np.isnan(ee_poses).any(axis=1) | (np.linalg.norm(ee_poses, axis=1) == 0)
+                
+                # 2. Project to pixels to check if points fall outside image bounds
+                try:
+                    ee_poses_px = cam_frame_to_cam_pixels(ee_poses, ARIA_INTRINSICS)
+                    out_of_bounds = (ee_poses_px[:, 0] < 0) | (ee_poses_px[:, 0] >= W) | \
+                                    (ee_poses_px[:, 1] < 0) | (ee_poses_px[:, 1] >= H)
+                    # Test if ee_poses_px is not 0,0
+                    corner_case = (ee_poses_px[:, 0] == 0) & (ee_poses_px[:, 1] == 0)
+
+                    invalid = invalid | out_of_bounds | corner_case
+                except Exception:
+                    pass # Fallback in case projection fails
+
                 if invalid.all():
                     # all invalid -> null masks
-                    H, W = imgs.shape[1], imgs.shape[2]
                     raw_masks = np.zeros((imgs.shape[0], H, W), dtype=bool)
                     masked_imgs = imgs
                     overlayed_imgs = imgs
@@ -509,8 +546,13 @@ def sam_processing(dataset, debug=False):
                         overlayed_imgs, masked_imgs, raw_masks = sam.get_hand_mask_line_batched(
                             imgs, ee_poses, ARIA_INTRINSICS, debug=debug
                         )
+                        
+                        # 3. Wipe out generated masks for strictly invalid frames
+                        raw_masks[invalid] = False
+                        masked_imgs[invalid] = imgs[invalid]
+                        overlayed_imgs[invalid] = imgs[invalid]
+                        
                     except Exception:
-                        H, W = imgs.shape[1], imgs.shape[2]
                         raw_masks = np.zeros((imgs.shape[0], H, W), dtype=bool)
                         masked_imgs = imgs
                         overlayed_imgs = imgs
@@ -571,7 +613,7 @@ def main(args):
             ee_pose_px = project_ee_to_pixels(ee_pose)
             N = actions.shape[0]
             print(f"{N} frames in vrs file")
-            chunk_size = 30  # Define chunk size
+            chunk_size = 50  # Define chunk size
             for i in range(0, N, chunk_size):
                 # print(i)
                 group = data.create_group(f"demo_{demo_index}")
@@ -590,11 +632,13 @@ def main(args):
                     "obs/front_img_1", data=front_img_1[i : i + chunk_size]
                 )
                 group.create_dataset("obs/ee_pose", data=ee_pose[i : i + chunk_size])
-                group.create_dataset(
-                    "obs/ee_pose_px", data=ee_pose_px[i : i + chunk_size]
-                )
-                debug_imgs = draw_ee_on_images(front_img_1[i : i + chunk_size], ee_pose_px[i : i + chunk_size])
-                group.create_dataset("obs/front_img_1_ee_debug", data=debug_imgs)
+
+                if args.debug:
+                    group.create_dataset(
+                        "obs/ee_pose_px", data=ee_pose_px[i : i + chunk_size]
+                    )
+                    debug_imgs = draw_ee_on_images(front_img_1[i : i + chunk_size], ee_pose_px[i : i + chunk_size])
+                    group.create_dataset("obs/front_img_1_ee_debug", data=debug_imgs)
                 demo_index += 1
             print(f"Completed adding {filename}")
             # break
