@@ -419,13 +419,13 @@ class SAM:
                     (int(px_dict["px_val_gripper_right"][i, 0]), int(px_dict["px_val_gripper_right"][i, 1])),
                     (int(px_dict["px_val_elbow_right"][i, 0]), int(px_dict["px_val_elbow_right"][i, 1])),
                     color=(255, 0, 0),
-                    thickness=2
+                    thickness=25
                 )
 
             if debug:
                 # Draw the input points SAM is using to test calibration
                 for pt in input_point:
-                    cv2.circle(line_img, (int(pt[0]), int(pt[1])), 10, (255, 0, 0), -1)
+                    cv2.circle(line_img, (int(pt[0]), int(pt[1])), 10, (0, 255, 0), -1)
 
             mask_images[i] = masked_img
             line_images[i] = line_img

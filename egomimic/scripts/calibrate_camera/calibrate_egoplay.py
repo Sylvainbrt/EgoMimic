@@ -105,7 +105,7 @@ def main():
                 gray,
                 estimate_tag_pose=True,
                 camera_params=camera_params,
-                tag_size=0.175,
+                tag_size=0.1361,
             )
 
             if len(detect_result) != 1:
