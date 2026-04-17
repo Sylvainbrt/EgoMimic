@@ -35,7 +35,6 @@ from egomimic.utils.egomimicUtils import (
     cam_frame_to_cam_pixels,
     WIDE_LENS_HAND_LEFT_K,
     ARIA_INTRINSICS,
-    ARIA_WIDE_INTRINSICS,
     interpolate_keys,
     interpolate_arr
 )
@@ -126,7 +125,8 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     center_px_test = ARIA_INTRINSICS @ np.array([0, 0, 1, 1])
     print(f"Optical center should be at: {center_px_test[:2]}")
 
-    for t in range(frame_length):
+    crop_frames = 80
+    for t in range(crop_frames, max(crop_frames, frame_length - crop_frames)):
         if (t % 1000) == 0:
             print(f"{t} frames ingested")
 
@@ -613,7 +613,7 @@ def main(args):
             ee_pose_px = project_ee_to_pixels(ee_pose)
             N = actions.shape[0]
             print(f"{N} frames in vrs file")
-            chunk_size = 50  # Define chunk size
+            chunk_size = 200  # Define chunk size
             for i in range(0, N, chunk_size):
                 # print(i)
                 group = data.create_group(f"demo_{demo_index}")

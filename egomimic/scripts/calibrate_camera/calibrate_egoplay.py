@@ -148,7 +148,7 @@ def main():
                     tag_px = tag_px / tag_px[2]
                     tag_px = (int(tag_px[0]), int(tag_px[1]))
                     cv2.circle(img, tag_px, 5, (255, 0, 0), -1)
-                plt.imsave(f"calibration_imgs_3/{t}_detection.png", img)
+                plt.imsave(f"calibration_imgs_4/{t}_detection.png", img)
 
             # if args.debug:
             #     print("Detected: ", pose_t, T.quat2axisangle(T.mat2quat(detect_result[0].pose_R)))
