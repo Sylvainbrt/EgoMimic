@@ -44,7 +44,7 @@
         "data_2": "/data/sybeuret/remote_aria_data/egomimic_process/converted/pick_and_place_160426_masked_right.hdf5",
         "data_2_type": "hand",
         "output_dir":"/data/sybeuret/output_trainings_egomimic",
-        "num_data_workers": 5,
+        "num_data_workers": 0,
         "hdf5_cache_mode": "low_dim",
         "hdf5_use_swmr": true,
         "hdf5_load_next_obs": false,
@@ -71,7 +71,7 @@
         "goal_mode": null,
         "cuda": true,
         "batch_size": 8,
-        "num_epochs": 1000,
+        "num_epochs": 500,
         "seed": 1,
         "imagenet_normalize_images": true
     },
