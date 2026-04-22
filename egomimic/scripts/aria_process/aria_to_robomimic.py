@@ -125,7 +125,7 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     center_px_test = ARIA_INTRINSICS @ np.array([0, 0, 1, 1])
     print(f"Optical center should be at: {center_px_test[:2]}")
 
-    crop_frames = 80
+    crop_frames = 50
     for t in range(crop_frames, max(crop_frames, frame_length - crop_frames)):
         if (t % 1000) == 0:
             print(f"{t} frames ingested")
