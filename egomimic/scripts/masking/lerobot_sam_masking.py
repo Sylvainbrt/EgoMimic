@@ -16,14 +16,40 @@ import h5py
 import torch
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
+import shutil
 
 from egomimic.utils.egomimicUtils import ARIA_INTRINSICS, EXTRINSICS
-# Use ariaJul29 extrinsics to test, to be calibrated later
-ROBOT_EXTRINSICS = EXTRINSICS["ariaSylvain"]
 from egomimic.scripts.masking.utils import SAM
 
 
-def sam_processing(dataset: str, debug: bool = False):
+def _resolve_extrinsics(extrinsics_key: str, arm: str):
+    if extrinsics_key not in EXTRINSICS:
+        available = ", ".join(sorted(EXTRINSICS.keys()))
+        raise KeyError(f"Unknown extrinsics key '{extrinsics_key}'. Available keys: {available}")
+
+    resolved = EXTRINSICS[extrinsics_key]
+    if isinstance(resolved, dict):
+        if arm not in resolved:
+            available_arms = ", ".join(sorted(resolved.keys()))
+            raise KeyError(
+                f"Extrinsics key '{extrinsics_key}' does not define arm '{arm}'. "
+                f"Available arms: {available_arms}"
+            )
+        return {arm: resolved[arm]}
+
+    # Backward compatibility for older single-matrix entries such as ariaJul29L/R.
+    return {arm: resolved}
+
+
+def sam_processing(
+    dataset: str,
+    extrinsics_key: str,
+    arm: str,
+    debug: bool = False,
+    output_dataset: str | None = None,
+    write_masked: bool = True,
+):
     """
     Iterate over all demos in the EgoMimic HDF5 and apply SAM2 hand masking.
     Writes the following datasets into each demo/obs group:
@@ -33,6 +59,13 @@ def sam_processing(dataset: str, debug: bool = False):
 
     Args:
         dataset: path to the EgoMimic HDF5 file
+        extrinsics_key: key inside egomimicUtils.EXTRINSICS
+        arm: which robot arm to project
+        output_dataset: optional destination path. If provided and different from
+            dataset, the input HDF5 is copied there first and masking is applied
+            to the copy.
+        write_masked: whether to write the full front_img_1_masked dataset. Set
+            False to reduce disk writes when only the line overlay is needed.
         debug:   enable debug visualisations inside SAM
     """
     if torch.cuda.get_device_properties(0).major >= 8:
@@ -40,8 +73,20 @@ def sam_processing(dataset: str, debug: bool = False):
         torch.backends.cudnn.allow_tf32 = True
 
     sam = SAM()
+    robot_extrinsics = _resolve_extrinsics(extrinsics_key, arm)
+    print(f"Using extrinsics='{extrinsics_key}' arm='{arm}'")
 
-    with h5py.File(dataset, "r+") as data:
+    dataset_path = Path(dataset)
+    target_path = Path(output_dataset) if output_dataset is not None else dataset_path
+
+    if target_path != dataset_path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Copying source dataset to: {target_path}")
+        shutil.copy2(dataset_path, target_path)
+
+    print(f"Writing results to: {target_path}")
+
+    with h5py.File(target_path, "r+") as data:
         demo_keys = sorted(data["data"].keys(), key=lambda k: int(k.split("_")[1]))
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -62,32 +107,44 @@ def sam_processing(dataset: str, debug: bool = False):
                 qpos       = obs["joint_positions"][:]    # (T, 7)
 
                 mask_images, line_images = sam.get_robot_mask_line_batched_from_qpos(
-                    imgs, qpos, ROBOT_EXTRINSICS, ARIA_INTRINSICS, arm="right", debug=debug
+                    imgs, qpos, robot_extrinsics, ARIA_INTRINSICS, arm=arm, debug=debug
                 )
 
                 
 
-                for key in ("front_img_1_masked", "front_img_1_mask", "front_img_1_line"):
+                keys_to_delete = ["front_img_1_mask", "front_img_1_line"]
+                if write_masked:
+                    keys_to_delete.append("front_img_1_masked")
+                for key in keys_to_delete:
                     if key in obs:
                         print(f"  [{demo_key}] Deleting existing '{key}'")
                         del obs[key]
 
                 T, H, W, _ = imgs.shape
-                obs.create_dataset(
-                    "front_img_1_masked",
-                    data=mask_images,
-                    chunks=(1, H, W, 3),
-                )
+                if write_masked:
+                    obs.create_dataset(
+                        "front_img_1_masked",
+                        data=mask_images,
+                        chunks=(1, H, W, 3),
+                    )
                 obs.create_dataset(
                     "front_img_1_line", 
                     data=line_images,
                     chunks=(1, H, W, 3),
                 )
+                data.flush()
 
 
 def main(args):
     if args.sam:
-        sam_processing(args.dataset, debug=args.debug)
+        sam_processing(
+            args.dataset,
+            extrinsics_key=args.extrinsics_key,
+            arm=args.arm,
+            debug=args.debug,
+            output_dataset=args.output_dataset,
+            write_masked=not args.line_only,
+        )
 
 
 if __name__ == "__main__":
@@ -112,6 +169,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--debug", action="store_true",
         help="Enable debug visualisations.",
+    )
+    parser.add_argument(
+        "--extrinsics-key", type=str, default="ariaSylvain",
+        help="Key from egomimicUtils.EXTRINSICS to use for projection.",
+    )
+    parser.add_argument(
+        "--arm", type=str, choices=["left", "right"], default="left",
+        help="Which single-arm configuration this dataset uses.",
+    )
+    parser.add_argument(
+        "--output-dataset", type=str, default=None,
+        help="Optional destination HDF5 path. If set, copy the input file there and write masking results to the copy.",
+    )
+    parser.add_argument(
+        "--line-only", action="store_true",
+        help="Only write front_img_1_line and skip front_img_1_masked to reduce disk usage.",
     )
 
     args = parser.parse_args()

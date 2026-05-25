@@ -9,9 +9,7 @@ import json
 import h5py
 from tqdm import tqdm
 
-from egomimic.utils.egomimicUtils import (
-    ARIA_INTRINSICS_ROTATED as ARIA_INTRINSICS
-)
+from egomimic.utils.egomimicUtils import ARIA_INTRINSICS
 
 from scipy.spatial.transform import Rotation as Rot
 import matplotlib.pyplot as plt
@@ -40,6 +38,8 @@ _VIPERX_LIMITS_RAD = np.array([
     [-0.0349,  0.0349],    # gripper
 ])
 
+_APRILTAG_SIZE_M = 0.1393
+
 
 def _joints_to_radians(q7: np.ndarray) -> np.ndarray:
     """Convert a (7,) joint vector to radians, auto-detecting units."""
@@ -57,28 +57,31 @@ def _fk_rot_pos(demo, t):
     """
     Return (Rot, pos) for frame t.
 
-    Tries obs/ee_pose_robot_frame first (EgoMimic-converted HDF5).
-    Falls back to FK from obs/joint_positions for raw LeRobot recordings.
+    Prefer FK from obs/joint_positions so calibration uses the same kinematic
+    path as SAM masking. Fall back to obs/ee_pose_robot_frame only if joints
+    are unavailable.
     """
+    if "obs/joint_positions" in demo:
+        q_raw = demo["obs/joint_positions"][t]
+
+        # Remove shadow motors if present (9 DOF → 7 DOF)
+        if q_raw.shape[0] == 9:
+            q7 = q_raw[_VIPERX_9_TO_7]
+        else:
+            q7 = q_raw   # already 7 DOF
+
+        q_rad = _joints_to_radians(np.asarray(q7, dtype=np.float64))
+
+        # FK via pytorch_kinematics — takes (1, 6) radians, returns 4×4 T_ee_in_base
+        q_tensor = torch.tensor(q_rad[:6], dtype=torch.float32).unsqueeze(0)
+        T_ee = _FK_CHAIN.forward_kinematics(q_tensor, end_only=True).get_matrix().squeeze(0).numpy()
+        return Rot.from_matrix(T_ee[:3, :3]), T_ee[:3, 3]
+
     if "obs/ee_pose_robot_frame" in demo:
         pose = demo["obs/ee_pose_robot_frame"][t]
         return Rot.from_quat(pose[3:]), pose[0:3]
 
-    # Raw recording path ─────────────────────────────────────────────────────
-    q_raw = demo["obs/joint_positions"][t]
-
-    # Remove shadow motors if present (9 DOF → 7 DOF)
-    if q_raw.shape[0] == 9:
-        q7 = q_raw[_VIPERX_9_TO_7]
-    else:
-        q7 = q_raw   # already 7 DOF
-
-    q_rad = _joints_to_radians(np.asarray(q7, dtype=np.float64))
-
-    # FK via pytorch_kinematics — takes (1, 6) radians, returns 4×4 T_ee_in_base
-    q_tensor = torch.tensor(q_rad[:6], dtype=torch.float32).unsqueeze(0)
-    T_ee = _FK_CHAIN.forward_kinematics(q_tensor, end_only=True).get_matrix().squeeze(0).numpy()
-    return Rot.from_matrix(T_ee[:3, :3]), T_ee[:3, 3]
+    raise KeyError("Expected either obs/joint_positions or obs/ee_pose_robot_frame in demo")
 
 
 def parse_args():
@@ -118,23 +121,18 @@ def main():
 
     april_detector = Detector()
 
-    # Intrinsics for the undistorted 640×480 landscape output of aria_camera.py:
-    #   raw Aria focal length 1103.3 scaled to 640/2560 = 275.825, cx=W/2=320, cy=H/2=240
-    F = 1103.3026085036342 * (640.0 / 2560.0)  # 275.825
+    # Use the shared pinhole intrinsics that correspond to the stored 640x480
+    # undistorted Aria frames.
+    intrinsics_matrix = ARIA_INTRINSICS.astype(np.float64)
     intrinsics = {
         "color": {
-            "fx": F,
-            "fy": F,
-            "cx": 320.0,
-            "cy": 240.0,
+            "fx": float(intrinsics_matrix[0, 0]),
+            "fy": float(intrinsics_matrix[1, 1]),
+            "cx": float(intrinsics_matrix[0, 2]),
+            "cy": float(intrinsics_matrix[1, 2]),
         }
     }
-    # Build the 3×4 K matrix used for the debug reprojection below
-    K_3x4 = np.array([
-        [F,   0.0, 320.0, 0.0],
-        [0.0,   F, 240.0, 0.0],
-        [0.0, 0.0,   1.0, 0.0],
-    ])
+    K_3x4 = intrinsics_matrix
 
     print(intrinsics)
 
@@ -166,7 +164,7 @@ def main():
                 gray,
                 estimate_tag_pose=True,
                 camera_params=camera_params,
-                tag_size=0.1393,
+                tag_size=_APRILTAG_SIZE_M,
             )
 
             if len(detect_result) != 1:
@@ -202,7 +200,7 @@ def main():
                     cv2.line(img, pt1, pt2, (0, 255, 0), 2)
 
                 # Reproject tag CORNERS using K — the definitive intrinsics test (blue)
-                half = detect_result[0].tag_size / 2.0
+                half = _APRILTAG_SIZE_M / 2.0
                 tag_corners_3d = np.array([
                     [-half, -half, 0],
                     [ half, -half, 0],
@@ -220,8 +218,9 @@ def main():
                 tag_px = tag_px / tag_px[2]
                 cv2.circle(img, (int(tag_px[0]), int(tag_px[1])), 8, (255, 0, 0), 2)
 
-                # Annotation: if blue dots sit on the green corners, K is correct
-                cv2.putText(img, "Green=detected  Blue=reprojected (K correct if they overlap)",
+                # Annotation: saved debug images are RGB, so the reprojected points
+                # appear red after drawing with OpenCV on the in-memory image.
+                cv2.putText(img, "Green=detected  Red=reprojected (K correct if they overlap)",
                             (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
                 plt.imsave(f"calibration_imgs_3/{t}_detection.png", img)
 
@@ -229,13 +228,14 @@ def main():
 
     print(f"==========Using {count} images================")
 
-    for method in [
-        cv2.CALIB_HAND_EYE_TSAI,
-        cv2.CALIB_HAND_EYE_PARK,
-        cv2.CALIB_HAND_EYE_DANIILIDIS,
-        cv2.CALIB_HAND_EYE_ANDREFF,
-        cv2.CALIB_HAND_EYE_HORAUD
-    ]:
+    hand_eye_methods = [
+        ("TSAI", cv2.CALIB_HAND_EYE_TSAI),
+        ("PARK", cv2.CALIB_HAND_EYE_PARK),
+        ("DANIILIDIS", cv2.CALIB_HAND_EYE_DANIILIDIS),
+        ("ANDREFF", cv2.CALIB_HAND_EYE_ANDREFF),
+        ("HORAUD", cv2.CALIB_HAND_EYE_HORAUD),
+    ]
+    for method_name, method in hand_eye_methods:
         R, t = cv2.calibrateHandEye(
             R_base2gripper_list,
             t_base2gripper_list,
@@ -245,7 +245,7 @@ def main():
         )
         fullT = np.concatenate((R, t), axis=1)
         fullT = np.concatenate((fullT, np.array([[0, 0, 0, 1]])), axis=0)
-        print("T: ", repr(fullT))
+        print(f"{method_name}: ", repr(fullT))
 
     print("==============================")
 
