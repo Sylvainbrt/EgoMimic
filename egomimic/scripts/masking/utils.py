@@ -13,6 +13,8 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 from egomimic.utils.egomimicUtils import AlohaFK, ee_pose_to_cam_pixels, ARIA_INTRINSICS, EXTRINSICS, ee_pose_to_cam_frame, cam_frame_to_cam_pixels, draw_dot_on_frame
 import cv2
 
+ROBOT_LINE_THICKNESS = 25
+
 def get_bounds(binary_image):
     # gray_image = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
 
@@ -95,8 +97,8 @@ def get_valid_points(points, img_shape):
         input_label = np.array([1, 1])
     elif not keep_pt1 and keep_pt2 and keep_pt3:
         # print("3rd case")
-        input_point = np.concatenate([pt3], axis=0)
-        input_label = np.array([1])
+        input_point = np.concatenate([pt2, pt3], axis=0)
+        input_label = np.array([1, 1])
     elif keep_pt1 and keep_pt2 and not keep_pt3:
         # print("4th case")
         input_point = np.concatenate([pt1, pt2], axis=0)
@@ -119,6 +121,31 @@ def get_valid_points(points, img_shape):
         input_label = np.array([])
 
     return input_point, input_label
+
+
+def _point_in_image(pt, img_shape):
+    return 0 <= pt[0] < img_shape[1] and 0 <= pt[1] < img_shape[0]
+
+
+def _draw_robot_polyline(image, points, color, thickness):
+    """
+    Draw a segmented arm overlay through the projected link points in order.
+    Points are expected as an iterable of (x, y) arrays.
+    """
+    valid_points = []
+    for pt in points:
+        pt = np.asarray(pt).reshape(-1)
+        if pt.shape[0] < 2:
+            continue
+        if _point_in_image(pt, image.shape):
+            valid_points.append((int(pt[0]), int(pt[1])))
+
+    if len(valid_points) < 2:
+        return image
+
+    for start, end in zip(valid_points[:-1], valid_points[1:]):
+        image = cv2.line(image, start, end, color=color, thickness=thickness)
+    return image
 
 class SAM:
     def __init__(self):
@@ -404,22 +431,28 @@ class SAM:
             line_img = masked_img.copy()
 
             if arm == "both" or arm == "left":
-                ## draw left line
-                line_img = cv2.line(
+                line_img = _draw_robot_polyline(
                     line_img,
-                    (int(px_dict["px_val_gripper_left"][i, 0]), int(px_dict["px_val_gripper_left"][i, 1])),
-                    (int(px_dict["px_val_elbow_left"][i, 0]), int(px_dict["px_val_elbow_left"][i, 1])),
+                    (
+                        px_dict["px_val_arm_left"][i],
+                        px_dict["px_val_elbow_left"][i],
+                        px_dict["px_val_wrist_left"][i],
+                        px_dict["px_val_gripper_left"][i],
+                    ),
                     color=(255, 0, 0),
-                    thickness=2
+                    thickness=ROBOT_LINE_THICKNESS,
                 )
             if arm == "both" or arm == "right":
-                ## draw right line
-                line_img = cv2.line(
+                line_img = _draw_robot_polyline(
                     line_img,
-                    (int(px_dict["px_val_gripper_right"][i, 0]), int(px_dict["px_val_gripper_right"][i, 1])),
-                    (int(px_dict["px_val_elbow_right"][i, 0]), int(px_dict["px_val_elbow_right"][i, 1])),
+                    (
+                        px_dict["px_val_arm_right"][i],
+                        px_dict["px_val_elbow_right"][i],
+                        px_dict["px_val_wrist_right"][i],
+                        px_dict["px_val_gripper_right"][i],
+                    ),
                     color=(255, 0, 0),
-                    thickness=25
+                    thickness=ROBOT_LINE_THICKNESS,
                 )
 
             if debug:

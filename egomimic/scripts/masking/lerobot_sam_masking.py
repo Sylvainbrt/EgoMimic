@@ -49,6 +49,8 @@ def sam_processing(
     debug: bool = False,
     output_dataset: str | None = None,
     write_masked: bool = True,
+    start_episode: int = 0,
+    max_episodes: int | None = None,
 ):
     """
     Iterate over all demos in the EgoMimic HDF5 and apply SAM2 hand masking.
@@ -66,6 +68,8 @@ def sam_processing(
             to the copy.
         write_masked: whether to write the full front_img_1_masked dataset. Set
             False to reduce disk writes when only the line overlay is needed.
+        start_episode: zero-based demo index to start from
+        max_episodes: optional number of demos to process from start_episode
         debug:   enable debug visualisations inside SAM
     """
     if torch.cuda.get_device_properties(0).major >= 8:
@@ -88,6 +92,14 @@ def sam_processing(
 
     with h5py.File(target_path, "r+") as data:
         demo_keys = sorted(data["data"].keys(), key=lambda k: int(k.split("_")[1]))
+        if start_episode < 0:
+            raise ValueError(f"start_episode must be >= 0, got {start_episode}")
+        demo_keys = demo_keys[start_episode:]
+        if max_episodes is not None:
+            if max_episodes <= 0:
+                raise ValueError(f"max_episodes must be > 0, got {max_episodes}")
+            demo_keys = demo_keys[:max_episodes]
+        print(f"Processing {len(demo_keys)} episode(s) starting from demo_{start_episode}")
 
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
             for demo_key in tqdm(demo_keys, desc="SAM masking"):
@@ -144,6 +156,8 @@ def main(args):
             debug=args.debug,
             output_dataset=args.output_dataset,
             write_masked=not args.line_only,
+            start_episode=args.start_episode,
+            max_episodes=args.max_episodes,
         )
 
 
@@ -185,6 +199,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--line-only", action="store_true",
         help="Only write front_img_1_line and skip front_img_1_masked to reduce disk usage.",
+    )
+    parser.add_argument(
+        "--start-episode", type=int, default=0,
+        help="Zero-based demo index to start from, e.g. 0 for demo_0.",
+    )
+    parser.add_argument(
+        "--max-episodes", type=int, default=None,
+        help="Optional number of demos to process from --start-episode.",
     )
 
     args = parser.parse_args()
