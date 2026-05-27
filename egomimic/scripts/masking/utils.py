@@ -170,19 +170,20 @@ class SAM:
         mask_images, line_images =  self.get_robot_mask_line_batched(images, px_dict, arm=arm, debug=debug)
         return mask_images, line_images
     
-    def get_hand_mask_line_batched(self, imgs, ee_poses, intrinsics, debug=False):
+    def get_hand_mask_line_batched(self, imgs, ee_poses, intrinsics, arm="right", debug=False):
+        _, height, width, _ = imgs.shape
         ## both hands
         if ee_poses.shape[-1] == 6:
             prompts_l = cam_frame_to_cam_pixels(ee_poses[:, :3], intrinsics)[:, :2]
             prompts_r = cam_frame_to_cam_pixels(ee_poses[:, 3:], intrinsics)[:, :2]
 
             masked_img_l, raw_masks_l = self.get_hand_mask_batched(imgs, prompts_l, neg_prompts=prompts_r)
-            mask = np.arange(640)[None, :] < prompts_l[:, [0]] + 100
+            mask = np.arange(width)[None, :] < prompts_l[:, [0]] + 100
             mask = mask[:, None, :]
             raw_masks_l = raw_masks_l & mask
 
             masked_img_r, raw_masks_r = self.get_hand_mask_batched(imgs, prompts_r, neg_prompts=prompts_l)
-            mask = np.arange(640)[None, :] > prompts_r[:, [0]] - 100
+            mask = np.arange(width)[None, :] > prompts_r[:, [0]] - 100
             mask = mask[:, None, :]
             raw_masks_r = raw_masks_r & mask
 
@@ -203,17 +204,22 @@ class SAM:
 
             masked_imgs, raw_masks = self.get_hand_mask_batched(imgs, prompts_r)
 
-            overlayed_imgs = line_on_hand(masked_imgs, raw_masks, "right")
+            overlayed_imgs = line_on_hand(masked_imgs, raw_masks, arm)
         else:
             raise ValueError(f"Invalid shape for ee_poses: {ee_poses.shape}")
         
         #cv2 imsave the masked_img_l and masked_img_r, bgr to rgb as well
         if debug:
-            breakpoint()
             for j in range(overlayed_imgs.shape[0]):
                 overlayed_imgs[j] = cv2.cvtColor(overlayed_imgs[j], cv2.COLOR_BGR2RGB)
-                overlayed_imgs[j] = draw_dot_on_frame(overlayed_imgs[j], prompts_l[[j]], palette="Set1")
-                overlayed_imgs[j] = draw_dot_on_frame(overlayed_imgs[j], prompts_r[[j]], palette="Set2")
+                if prompts_l is not None:
+                    overlayed_imgs[j] = draw_dot_on_frame(
+                        overlayed_imgs[j], prompts_l[[j]], palette="Set1"
+                    )
+                if prompts_r is not None:
+                    overlayed_imgs[j] = draw_dot_on_frame(
+                        overlayed_imgs[j], prompts_r[[j]], palette="Set2"
+                    )
                 cv2.imwrite(f"./overlays/overlayed_img_{j}.png", overlayed_imgs[j])
                 cv2.imwrite(f"./overlays/masked_img_{j}.png", cv2.cvtColor(masked_imgs[j], cv2.COLOR_BGR2RGB))
                 cv2.imwrite(f"./overlays/mask_{j}.png", raw_masks[j].astype(np.uint8) * 255)
@@ -228,7 +234,7 @@ class SAM:
             returns: raw_masks
         """
         masked_imgs = np.zeros_like(images)
-        raw_masks = np.zeros((images.shape[0], 480, 640)).astype(bool)
+        raw_masks = np.zeros(images.shape[:3], dtype=bool)
 
         for k in range(images.shape[0]):
             img = images[k]
@@ -257,7 +263,13 @@ class SAM:
         Masked image, mask, score, logits
         """
         input_point = pos_prompt
-        if input_point[0, 0] > 640 or input_point[0, 1] > 480 or input_point[0, 0] < 0 or input_point[0, 1] < 0:
+        height, width = img.shape[:2]
+        if (
+            input_point[0, 0] >= width
+            or input_point[0, 1] >= height
+            or input_point[0, 0] < 0
+            or input_point[0, 1] < 0
+        ):
             masked_img = img
             return None
         input_label = np.array([1])

@@ -21,6 +21,7 @@ from projectaria_tools.core.calibration import CameraCalibration, DeviceCalibrat
 from projectaria_tools.core.sensor_data import TimeDomain, TimeQueryOptions
 
 from aria_utils import (
+    ARIA_LINEAR_FOCAL,
     build_camera_matrix,
     undistort_to_linear,
     split_train_val_from_hdf5,
@@ -30,11 +31,14 @@ from aria_utils import (
 import argparse
 
 import json
+import csv
+import bisect
 
 from egomimic.utils.egomimicUtils import (
     cam_frame_to_cam_pixels,
     WIDE_LENS_HAND_LEFT_K,
     ARIA_INTRINSICS,
+    ARIA_INTRINSICS_ROTATED,
     interpolate_keys,
     interpolate_arr
 )
@@ -42,6 +46,96 @@ from egomimic.scripts.masking.utils import *
 
 HORIZON = 10
 STEP = 3
+EGO_ROTATION_MATRIX = np.array(
+    [
+        [0, -1, 0],
+        [1, 0, 0],
+        [0, 0, 1],
+    ],
+    dtype=np.float32,
+)
+EGO_ROTATION_MATRIX_INV = EGO_ROTATION_MATRIX.T
+
+
+def intrinsics_for_image_shape(image_shape):
+    h, w = image_shape[:2]
+    return np.array(
+        [
+            [ARIA_LINEAR_FOCAL, 0.0, w / 2.0, 0.0],
+            [0.0, ARIA_LINEAR_FOCAL, h / 2.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _valid_hand(hand_obj):
+    return hand_obj is not None and getattr(hand_obj, "confidence", 0) > 0
+
+
+def _get_palm_position_device(hand_obj):
+    if hasattr(hand_obj, "get_palm_position_device"):
+        return hand_obj.get_palm_position_device()
+    return hand_obj.palm_position_device
+
+
+def _get_wrist_position_device(hand_obj):
+    if hasattr(hand_obj, "get_wrist_position_device"):
+        return hand_obj.get_wrist_position_device()
+    return hand_obj.wrist_position_device
+
+
+def _apply_rotation_to_groups(arr, rotation_matrix):
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return arr
+    if arr.shape[-1] % 3 != 0:
+        raise ValueError(f"Expected last dim to be a multiple of 3, got shape {arr.shape}")
+    reshaped = arr.reshape(*arr.shape[:-1], -1, 3)
+    rotated = np.einsum("ij,...gj->...gi", rotation_matrix, reshaped)
+    return rotated.reshape(arr.shape)
+
+
+def _load_valid_hand_timestamps_us(hand_tracking_results_path):
+    valid = {"left": [], "right": []}
+    with open(hand_tracking_results_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts_us = int(row["tracking_timestamp_us"])
+            try:
+                left_conf = float(row.get("left_tracking_confidence", -1))
+            except Exception:
+                left_conf = -1
+            try:
+                right_conf = float(row.get("right_tracking_confidence", -1))
+            except Exception:
+                right_conf = -1
+            if left_conf > 0:
+                valid["left"].append(ts_us)
+            if right_conf > 0:
+                valid["right"].append(ts_us)
+    return valid
+
+
+def _find_nearest_valid_timestamp_ns(valid_timestamps_us, target_timestamp_ns, max_delta_ms):
+    if not valid_timestamps_us:
+        return None
+    target_us = target_timestamp_ns / 1000.0
+    idx = bisect.bisect_left(valid_timestamps_us, target_us)
+    best = None
+    best_delta = None
+    for cand_idx in (idx - 1, idx):
+        if 0 <= cand_idx < len(valid_timestamps_us):
+            cand_us = valid_timestamps_us[cand_idx]
+            delta_us = abs(cand_us - target_us)
+            if best_delta is None or delta_us < best_delta:
+                best_delta = delta_us
+                best = cand_us * 1000
+    if best is None:
+        return None
+    if best_delta is not None and best_delta <= max_delta_ms * 1000.0:
+        return int(best)
+    return None
 
 
 """
@@ -52,7 +146,16 @@ python aria_to_robomimic.py --dataset /coc/flash7/datasets/egoplay/oboo_aria_apr
 # Load the VRS file
 
 
-def single_file_conversion(dataset, mps_sample_path, filename, hand):
+def single_file_conversion(
+    dataset,
+    mps_sample_path,
+    filename,
+    hand,
+    rotate90="cw",
+    crop_frames=50,
+    max_rgb_frames=None,
+    hand_time_tolerance_ms=33.0,
+):
     """
     dataset: path to the dataset
     mps_sample_path: path to the mps sample
@@ -63,15 +166,15 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     """
     vrsfile = os.path.join(dataset, filename)
 
-    # Hand tracking CSV (your recreated file)
-    wrist_and_palm_poses_path = os.path.join(
-        mps_sample_path, "hand_tracking", "wrist_and_palm_poses.csv"
+    hand_tracking_results_path = os.path.join(
+        mps_sample_path, "hand_tracking", "hand_tracking_results.csv"
     )
 
     provider = data_provider.create_vrs_data_provider(vrsfile)
 
     # Load hand tracking
-    _ = mps.hand_tracking.read_wrist_and_palm_poses(wrist_and_palm_poses_path)
+    _ = mps.hand_tracking.read_hand_tracking_results(hand_tracking_results_path)
+    valid_hand_timestamps_us = _load_valid_hand_timestamps_us(hand_tracking_results_path)
 
     device_calibration = provider.get_device_calibration()
     time_domain: TimeDomain = TimeDomain.DEVICE_TIME
@@ -114,41 +217,65 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     T_rgb_camera_device = T_device_rgb_camera.inverse()
 
     frame_length = len(stream_timestamps_ns["rgb"])
+    if max_rgb_frames is not None:
+        frame_length = min(frame_length, max_rgb_frames)
     print(f"Total RGB frames: {frame_length}")
 
     actions_list = []
     imgs_list = []
     ee_pose_list = []
+    wrist_pose_list = []
 
     ac_dim = 3 if hand != "bimanual" else 6
+    stats = {
+        "total_rgb_frames": frame_length,
+        "crop_frames_each_side": crop_frames,
+        "candidate_frames": 0,
+        "skipped_missing_reference_hand": 0,
+        "skipped_rgb_read_error": 0,
+        "skipped_missing_pose_t": 0,
+        "kept_frames": 0,
+    }
 
     center_px_test = ARIA_INTRINSICS @ np.array([0, 0, 1, 1])
     print(f"Optical center should be at: {center_px_test[:2]}")
 
-    crop_frames = 50
     for t in range(crop_frames, max(crop_frames, frame_length - crop_frames)):
+        stats["candidate_frames"] += 1
         if (t % 1000) == 0:
             print(f"{t} frames ingested")
 
         sample_timestamp_ns_t = stream_timestamps_ns["rgb"][t]
 
-        # Get wrist pose at reference time
-        wrist_t = mps_data_provider.get_wrist_and_palm_pose(
-            sample_timestamp_ns_t, time_query_closest
+        # Get a valid hand pose near the RGB timestamp instead of requiring the
+        # nearest overall hand-tracking sample to also be valid.
+        ref_left_ns = _find_nearest_valid_timestamp_ns(
+            valid_hand_timestamps_us["left"], sample_timestamp_ns_t, hand_time_tolerance_ms
         )
-        if wrist_t is None:
-            continue
+        ref_right_ns = _find_nearest_valid_timestamp_ns(
+            valid_hand_timestamps_us["right"], sample_timestamp_ns_t, hand_time_tolerance_ms
+        )
 
-        # Require chosen hand at reference time
-        if hand == "right":
-            if wrist_t.right_hand is None:
+        if hand == "left":
+            if ref_left_ns is None:
+                stats["skipped_missing_reference_hand"] += 1
                 continue
-        elif hand == "left":
-            if wrist_t.left_hand is None:
+            wrist_t = mps_data_provider.get_hand_tracking_result(ref_left_ns, time_query_closest)
+        elif hand == "right":
+            if ref_right_ns is None:
+                stats["skipped_missing_reference_hand"] += 1
                 continue
-        else:  # bimanual: at least one hand at t
-            if (wrist_t.left_hand is None) and (wrist_t.right_hand is None):
+            wrist_t = mps_data_provider.get_hand_tracking_result(ref_right_ns, time_query_closest)
+        else:
+            if ref_left_ns is None and ref_right_ns is None:
+                stats["skipped_missing_reference_hand"] += 1
                 continue
+            ref_ns = ref_left_ns if ref_left_ns is not None else ref_right_ns
+            wrist_t = mps_data_provider.get_hand_tracking_result(ref_ns, time_query_closest)
+
+        if wrist_t is None:
+            stats["skipped_missing_reference_hand"] += 1
+            continue
 
         # Load RGB frame; skip only this t if it fails
         try:
@@ -159,12 +286,14 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
                 time_query_closest,
             )[0]
         except Exception:
+            stats["skipped_rgb_read_error"] += 1
             continue
 
         img_t = undistort_to_linear(
             provider,
             stream_ids,
             raw_image=frame_rgb.to_numpy_array(),
+            rotate_90=rotate90,
         )
 
         # Closed-loop pose at t (camera pose); if missing we cannot define camera frame
@@ -172,40 +301,47 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
             sample_timestamp_ns_t, time_query_closest
         )
         if pose_t is None:
+            stats["skipped_missing_pose_t"] += 1
             continue
 
         camera_matrix_t = build_camera_matrix(vrs_data_provider, pose_t)
         camera_t_inv = np.linalg.inv(camera_matrix_t)
 
-        # Rotation to EgoMimic convention
-        rotation_matrix = np.array([[0, -1, 0],
-                                    [1, 0, 0],
-                                    [0, 0, 1]])
-
-
-
         # ee_pose at reference frame in camera_t
         if hand == "right":
-            palm_dev = wrist_t.right_hand.palm_position_device
+            palm_dev = _get_palm_position_device(wrist_t.right_hand)
+            wrist_dev = _get_wrist_position_device(wrist_t.right_hand)
             # Ensure the evaluated 3D point strictly has shape (3,)
             palm_cam_t = np.array(T_rgb_camera_device @ palm_dev).flatten()
+            wrist_cam_t = np.array(T_rgb_camera_device @ wrist_dev).flatten()
 
             # Rotate to EgoMimic convention
-            ee_pose_obs_t = rotation_matrix @ palm_cam_t
+            ee_pose_obs_t = EGO_ROTATION_MATRIX @ palm_cam_t
+            wrist_pose_obs_t = EGO_ROTATION_MATRIX @ wrist_cam_t
         elif hand == "left":
-            palm_dev = wrist_t.left_hand.palm_position_device
+            palm_dev = _get_palm_position_device(wrist_t.left_hand)
+            wrist_dev = _get_wrist_position_device(wrist_t.left_hand)
             palm_cam_t = np.array(T_rgb_camera_device @ palm_dev).flatten()
-            ee_pose_obs_t = rotation_matrix @ palm_cam_t
+            wrist_cam_t = np.array(T_rgb_camera_device @ wrist_dev).flatten()
+            ee_pose_obs_t = EGO_ROTATION_MATRIX @ palm_cam_t
+            wrist_pose_obs_t = EGO_ROTATION_MATRIX @ wrist_cam_t
         else:
             ee_pose_obs_t = np.zeros(6, dtype=np.float32)
-            if wrist_t.left_hand is not None:
-                palm_l_dev = wrist_t.left_hand.palm_position_device
+            wrist_pose_obs_t = np.zeros(6, dtype=np.float32)
+            if _valid_hand(wrist_t.left_hand):
+                palm_l_dev = _get_palm_position_device(wrist_t.left_hand)
+                wrist_l_dev = _get_wrist_position_device(wrist_t.left_hand)
                 palm_l_cam_t = np.array(T_rgb_camera_device @ palm_l_dev).flatten()
-                ee_pose_obs_t[:3] = rotation_matrix @ palm_l_cam_t
-            if wrist_t.right_hand is not None:
-                palm_r_dev = wrist_t.right_hand.palm_position_device
+                wrist_l_cam_t = np.array(T_rgb_camera_device @ wrist_l_dev).flatten()
+                ee_pose_obs_t[:3] = EGO_ROTATION_MATRIX @ palm_l_cam_t
+                wrist_pose_obs_t[:3] = EGO_ROTATION_MATRIX @ wrist_l_cam_t
+            if _valid_hand(wrist_t.right_hand):
+                palm_r_dev = _get_palm_position_device(wrist_t.right_hand)
+                wrist_r_dev = _get_wrist_position_device(wrist_t.right_hand)
                 palm_r_cam_t = np.array(T_rgb_camera_device @ palm_r_dev).flatten()
-                ee_pose_obs_t[3:] = rotation_matrix @ palm_r_cam_t
+                wrist_r_cam_t = np.array(T_rgb_camera_device @ wrist_r_dev).flatten()
+                ee_pose_obs_t[3:] = EGO_ROTATION_MATRIX @ palm_r_cam_t
+                wrist_pose_obs_t[3:] = EGO_ROTATION_MATRIX @ wrist_r_cam_t
 
         actions_t = np.zeros((HORIZON, ac_dim), dtype=np.float32)
 
@@ -216,8 +352,23 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
                 break
 
             ts_ns = stream_timestamps_ns["rgb"][idx]
-            wrist_off = mps_data_provider.get_wrist_and_palm_pose(
-                ts_ns, time_query_closest
+            off_left_ns = _find_nearest_valid_timestamp_ns(
+                valid_hand_timestamps_us["left"], ts_ns, hand_time_tolerance_ms
+            )
+            off_right_ns = _find_nearest_valid_timestamp_ns(
+                valid_hand_timestamps_us["right"], ts_ns, hand_time_tolerance_ms
+            )
+            query_ns = None
+            if hand == "left":
+                query_ns = off_left_ns
+            elif hand == "right":
+                query_ns = off_right_ns
+            else:
+                query_ns = off_left_ns if off_left_ns is not None else off_right_ns
+            wrist_off = (
+                mps_data_provider.get_hand_tracking_result(query_ns, time_query_closest)
+                if query_ns is not None
+                else None
             )
             pose_off = mps_data_provider.get_closed_loop_pose(
                 ts_ns, time_query_closest
@@ -229,31 +380,31 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
             cam_mat_off = build_camera_matrix(vrs_data_provider, pose_off)
 
             if hand == "right":
-                if wrist_off.right_hand is None:
+                if not _valid_hand(wrist_off.right_hand):
                     continue
-                palm_dev = wrist_off.right_hand.palm_position_device
+                palm_dev = _get_palm_position_device(wrist_off.right_hand)
                 palm_cam = (transform @ palm_dev).T
                 palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
                 world = (cam_mat_off @ palm_cam_h.T).T  # (1,4)
                 palm_in_cam_t = (camera_t_inv @ world.T).T[0, :3]
                 actions_t[offset, :] = palm_in_cam_t
             elif hand == "left":
-                if wrist_off.left_hand is None:
+                if not _valid_hand(wrist_off.left_hand):
                     continue
-                palm_dev = wrist_off.left_hand.palm_position_device
+                palm_dev = _get_palm_position_device(wrist_off.left_hand)
                 palm_cam = (transform @ palm_dev).T
                 palm_cam_h = np.concatenate([palm_cam, np.ones((1, 1))], axis=1)
                 world = (cam_mat_off @ palm_cam_h.T).T
                 palm_in_cam_t = (camera_t_inv @ world.T).T[0, :3]
                 actions_t[offset, :] = palm_in_cam_t
             else:  # bimanual
-                have_l = wrist_off.left_hand is not None
-                have_r = wrist_off.right_hand is not None
+                have_l = _valid_hand(wrist_off.left_hand)
+                have_r = _valid_hand(wrist_off.right_hand)
                 if not (have_l or have_r):
                     continue
 
                 if have_l:
-                    palm_l_dev = wrist_off.left_hand.palm_position_device
+                    palm_l_dev = _get_palm_position_device(wrist_off.left_hand)
                     palm_l_cam = (transform @ palm_l_dev).T
                     palm_l_cam_h = np.concatenate(
                         [palm_l_cam, np.ones((1, 1))], axis=1
@@ -264,7 +415,7 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
                     cam_l_t = np.zeros(3, dtype=np.float32)
 
                 if have_r:
-                    palm_r_dev = wrist_off.right_hand.palm_position_device
+                    palm_r_dev = _get_palm_position_device(wrist_off.right_hand)
                     palm_r_cam = (transform @ palm_r_dev).T
                     palm_r_cam_h = np.concatenate(
                         [palm_r_cam, np.ones((1, 1))], axis=1
@@ -277,25 +428,24 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
                 actions_t[offset, :] = np.concatenate([cam_l_t, cam_r_t], axis=0)
 
         # Rotate actions to EgoMimic convention
-        if ac_dim == 3:
-            rotated_actions_t = (rotation_matrix @ actions_t.T).T
-        else:
-            rotated_actions_t = actions_t.copy()
-            rotated_actions_t[:, :3] = (rotation_matrix @ actions_t[:, :3].T).T
-            rotated_actions_t[:, 3:] = (rotation_matrix @ actions_t[:, 3:].T).T
+        rotated_actions_t = _apply_rotation_to_groups(actions_t, EGO_ROTATION_MATRIX)
 
         actions_list.append(rotated_actions_t)
         imgs_list.append(img_t)
         ee_pose_list.append(ee_pose_obs_t)
+        wrist_pose_list.append(wrist_pose_obs_t)
+        stats["kept_frames"] += 1
 
     if len(actions_list) == 0:
         return np.zeros((0, HORIZON, ac_dim)), \
                np.zeros((0, 1, 1, 3), dtype=np.uint8), \
-               np.zeros((0, ac_dim))
+               np.zeros((0, ac_dim)), \
+               np.zeros((0, ac_dim)), stats
 
     actions = np.stack(actions_list, axis=0)
     front_img_1 = np.stack(imgs_list, axis=0)
     ee_pose = np.stack(ee_pose_list, axis=0)
+    wrist_pose = np.stack(wrist_pose_list, axis=0)
 
     # Filter by FOV / jumps (same as before, but no additional frame skipping)
     ac_dim = actions.shape[-1]
@@ -336,42 +486,15 @@ def single_file_conversion(dataset, mps_sample_path, filename, hand):
     # front_img_1 = front_img_1[~bad_data_mask]
     # ee_pose = ee_pose[~bad_data_mask]
 
-    return actions, front_img_1, ee_pose
+    return actions, front_img_1, ee_pose, wrist_pose, stats
 
 def transform_ee_pose(ee_pose):
-    if ee_pose.shape[1] == 3:
-        ee_pose[:, 0] *= -1  # Multiply x by -1
-        ee_pose[:, 1] *= -1  # Multiply y by -1
-    elif ee_pose.shape[1] == 6:
-        ee_pose[:, 0] *= -1  # Multiply x by -1 for first set
-        ee_pose[:, 1] *= -1  # Multiply y by -1 for first set
-        ee_pose[:, 3] *= -1  # Multiply x by -1 for second set
-        ee_pose[:, 4] *= -1  # Multiply y by -1 for second set
-
-    return ee_pose
+    return _apply_rotation_to_groups(ee_pose, EGO_ROTATION_MATRIX_INV)
 
 
 def transform_actions(actions):
     print("Transforming coordinates for actions and ee_pose")
-
-    if actions.shape[1] == 3:
-        actions[:, 0] *= -1  # Multiply x by -1
-        actions[:, 1] *= -1  # Multiply y by -1
-    elif actions.shape[1] == 6:
-        actions[:, 0] *= -1  # Multiply x by -1 for first set
-        actions[:, 1] *= -1  # Multiply y by -1 for first set
-        actions[:, 3] *= -1  # Multiply x by -1 for second set
-        actions[:, 4] *= -1  # Multiply y by -1 for second set
-    elif actions.shape[1] == 30:
-        for i in range(10):
-            actions[:, 3 * i] *= -1  # Multiply x by -1 for each set
-            actions[:, 3 * i + 1] *= -1  # Multiply y by -1 for each set
-    elif actions.shape[1] == 60:
-        for i in range(20):
-            actions[:, 3 * i] *= -1  # Multiply x by -1 for each set
-            actions[:, 3 * i + 1] *= -1  # Multiply y by -1 for each set
-
-    return actions
+    return _apply_rotation_to_groups(actions, EGO_ROTATION_MATRIX_INV)
 
 
 def get_bounds(binary_image):
@@ -436,7 +559,7 @@ def line_on_hand(images, masks, arm):
     
     return overlayed_imgs
 
-def project_ee_to_pixels(ee_pose):
+def project_ee_to_pixels(ee_pose, intrinsics):
     """
     Project ee_pose (N,3) or (N,6) assumed to be in camera frame
     into pixel coordinates using ARIA_INTRINSICS.
@@ -450,14 +573,14 @@ def project_ee_to_pixels(ee_pose):
 
     if ee_pose.shape[1] == 3:
         # (N,3) -> (N,2)
-        px = cam_frame_to_cam_pixels(ee_pose, ARIA_INTRINSICS)  # expects (N,3)
+        px = cam_frame_to_cam_pixels(ee_pose, intrinsics)  # expects (N,3)
         return px.astype(np.int32)
 
     if ee_pose.shape[1] == 6:
         left = ee_pose[:, :3]
         right = ee_pose[:, 3:6]
-        px_l = cam_frame_to_cam_pixels(left, ARIA_INTRINSICS)   # (N,2)
-        px_r = cam_frame_to_cam_pixels(right, ARIA_INTRINSICS)  # (N,2)
+        px_l = cam_frame_to_cam_pixels(left, intrinsics)   # (N,2)
+        px_r = cam_frame_to_cam_pixels(right, intrinsics)  # (N,2)
         px = np.concatenate([px_l, px_r], axis=1)               # (N,4)
         return px.astype(np.int32)
 
@@ -501,7 +624,7 @@ def draw_ee_on_images(images, ee_pose_px):
 
     return out
 
-def sam_processing(dataset, debug=False):
+def sam_processing(dataset, arm="right", debug=False):
     """
     Applying masking to all images in the dataset
 
@@ -518,15 +641,22 @@ def sam_processing(dataset, debug=False):
             for i in tqdm(range(len(data["data"].keys()))):
                 demo = data[f"data/demo_{i}"]
                 imgs = demo["obs/front_img_1"][:]
-                ee_poses = demo["obs/ee_pose"][:]
+                if "wrist_pose" in demo["obs"]:
+                    ee_poses = demo["obs/wrist_pose"][:]
+                else:
+                    ee_poses = demo["obs/ee_pose"][:]
+                ee_poses_camera = transform_ee_pose(ee_poses.copy())
                 H, W = imgs.shape[1], imgs.shape[2]
+                intrinsics = intrinsics_for_image_shape(imgs.shape[1:3])
 
                 # 1. Detect invalid ee_poses: NaN or all zeros
-                invalid = np.isnan(ee_poses).any(axis=1) | (np.linalg.norm(ee_poses, axis=1) == 0)
+                invalid = np.isnan(ee_poses_camera).any(axis=1) | (
+                    np.linalg.norm(ee_poses_camera, axis=1) == 0
+                )
                 
                 # 2. Project to pixels to check if points fall outside image bounds
                 try:
-                    ee_poses_px = cam_frame_to_cam_pixels(ee_poses, ARIA_INTRINSICS)
+                    ee_poses_px = cam_frame_to_cam_pixels(ee_poses_camera, intrinsics)
                     out_of_bounds = (ee_poses_px[:, 0] < 0) | (ee_poses_px[:, 0] >= W) | \
                                     (ee_poses_px[:, 1] < 0) | (ee_poses_px[:, 1] >= H)
                     # Test if ee_poses_px is not 0,0
@@ -544,7 +674,7 @@ def sam_processing(dataset, debug=False):
                 else:
                     try:
                         overlayed_imgs, masked_imgs, raw_masks = sam.get_hand_mask_line_batched(
-                            imgs, ee_poses, ARIA_INTRINSICS, debug=debug
+                            imgs, ee_poses_camera, intrinsics, arm=arm, debug=debug
                         )
                         
                         # 3. Wipe out generated masks for strictly invalid frames
@@ -567,23 +697,29 @@ def sam_processing(dataset, debug=False):
                 demo["obs"].create_dataset(
                     "front_img_1_masked",
                     data=masked_imgs,
-                    chunks=(1, 480, 640, 3),
+                    chunks=(1, H, W, 3),
                 )
                 demo["obs"].create_dataset(
                     "front_img_1_mask",
                     data=raw_masks,
-                    chunks=(1, 480, 640),
+                    chunks=(1, H, W),
                     dtype=bool,
                 )
                 demo["obs"].create_dataset(
                     "front_img_1_line",
                     data=overlayed_imgs,
-                    chunks=(1, 480, 640, 3),
+                    chunks=(1, H, W, 3),
                 )
 
 
 def main(args):
-    filenames = [f for f in os.listdir(args.dataset) if f.endswith(".vrs")]
+    filenames = sorted([f for f in os.listdir(args.dataset) if f.endswith(".vrs")])
+    if args.file_contains:
+        filenames = [f for f in filenames if args.file_contains in f]
+    if args.start_file > 0:
+        filenames = filenames[args.start_file:]
+    if args.max_files is not None:
+        filenames = filenames[: args.max_files]
     mps_paths = [
         os.path.join(args.dataset, "mps_" + filename.split(".")[0] + "_vrs")
         for filename in filenames
@@ -605,15 +741,38 @@ def main(args):
         print(f"Using {args.hand} data")
         for j, filename in enumerate(filenames):
             print(f"Adding {filename} to hdf5 file")
-            actions, front_img_1, ee_pose = single_file_conversion(
-                args.dataset, mps_paths[j], filename, args.hand
+            actions, front_img_1, ee_pose, wrist_pose, stats = single_file_conversion(
+                args.dataset,
+                mps_paths[j],
+                filename,
+                args.hand,
+                args.rotate90,
+                args.crop_frames,
+                args.max_rgb_frames,
+                args.hand_time_tolerance_ms,
             )
             # actions, ee_pose = transform_actions(actions), transform_ee_pose(ee_pose)
             actions, ee_pose = actions, ee_pose
-            ee_pose_px = project_ee_to_pixels(ee_pose)
             N = actions.shape[0]
+            intrinsics = (
+                intrinsics_for_image_shape(front_img_1.shape[1:3])
+                if N > 0
+                else ARIA_INTRINSICS
+            )
+            debug_pose = wrist_pose if wrist_pose.shape[0] == N else ee_pose
+            ee_pose_px = project_ee_to_pixels(transform_ee_pose(debug_pose.copy()), intrinsics)
             print(f"{N} frames in vrs file")
-            chunk_size = 200  # Define chunk size
+            chunk_size = args.demo_chunk_size
+            n_demos = int(np.ceil(N / chunk_size)) if chunk_size > 0 else 0
+            print(
+                "Conversion stats:",
+                {
+                    **stats,
+                    "output_frames": int(N),
+                    "demo_chunk_size": int(chunk_size),
+                    "output_demos": int(n_demos),
+                },
+            )
             for i in range(0, N, chunk_size):
                 # print(i)
                 group = data.create_group(f"demo_{demo_index}")
@@ -632,6 +791,7 @@ def main(args):
                     "obs/front_img_1", data=front_img_1[i : i + chunk_size]
                 )
                 group.create_dataset("obs/ee_pose", data=ee_pose[i : i + chunk_size])
+                group.create_dataset("obs/wrist_pose", data=wrist_pose[i : i + chunk_size])
 
                 if args.debug:
                     group.create_dataset(
@@ -649,7 +809,7 @@ def main(args):
     ## Apply masking
     if args.mask:
         print("Starting Masking")
-        sam_processing(args.out, args.debug)
+        sam_processing(args.out, args.hand, args.debug)
 
 
 
@@ -677,7 +837,56 @@ if __name__ == "__main__":
         help="if true, debug runs for two files only. Defaults to False",
     )
     parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Optional number of .vrs files to process.",
+    )
+    parser.add_argument(
+        "--start-file",
+        type=int,
+        default=0,
+        help="Optional zero-based index of the first .vrs file to process after sorting.",
+    )
+    parser.add_argument(
+        "--file-contains",
+        type=str,
+        default=None,
+        help="Optional substring filter on the .vrs filename for debugging a specific recording.",
+    )
+    parser.add_argument(
+        "--max-rgb-frames",
+        type=int,
+        default=None,
+        help="Optional cap on the number of RGB frames read from each file for faster debugging.",
+    )
+    parser.add_argument(
+        "--crop-frames",
+        type=int,
+        default=50,
+        help="Number of RGB frames to discard at the start and end of each file.",
+    )
+    parser.add_argument(
         "--mask", action="store_true"
+    )
+    parser.add_argument(
+        "--demo-chunk-size",
+        type=int,
+        default=200,
+        help="Number of kept frames per HDF5 demo chunk. Smaller values create more demos.",
+    )
+    parser.add_argument(
+        "--rotate90",
+        type=str,
+        choices=["cw", "ccw", "none"],
+        default="cw",
+        help="Apply a 90 degree rotation to the undistorted RGB image. Use 'ccw' for Gen2 if the image is sideways the wrong way.",
+    )
+    parser.add_argument(
+        "--hand-time-tolerance-ms",
+        type=float,
+        default=33.0,
+        help="Allow matching an RGB frame to the nearest valid hand-tracking sample within this time window.",
     )
     # parser.add_argument(
     #     "--prestack", action="store_true", help="if true, stacks actions in Tx3"
