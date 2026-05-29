@@ -29,6 +29,8 @@ RUN_TAG="${RUN_TAG:-pap_debug_small}"
 DEBUG_MODE="${DEBUG_MODE:-1}"
 NO_WANDB="${NO_WANDB:-1}"
 DRY_RUN="${DRY_RUN:-0}"
+USE_MIX_SCHEDULE="${USE_MIX_SCHEDULE:-0}"
+MIX_SCHEDULE_PROFILE="${MIX_SCHEDULE_PROFILE:-default}"
 
 BATCH_SIZE="${BATCH_SIZE:-4}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
@@ -44,6 +46,13 @@ RUN_ROBOT_HUMAN_UNMASKED="${RUN_ROBOT_HUMAN_UNMASKED:-1}"
 ROBOT_ONLY_CONFIG="egomimic/configs/act.json"
 MASKED_CONFIG="egomimic/configs/egomimic_lerobot_pap.json"
 UNMASKED_CONFIG="egomimic/configs/egomimic_lerobot_pap_nomask.json"
+PAIRED_RUN_SUFFIX=""
+
+if [[ "$USE_MIX_SCHEDULE" == "1" ]]; then
+  MASKED_CONFIG="egomimic/configs/egomimic_lerobot_pap_sched.json"
+  UNMASKED_CONFIG="egomimic/configs/egomimic_lerobot_pap_nomask_sched.json"
+  PAIRED_RUN_SUFFIX="_mix_sched"
+fi
 
 banner() {
   printf '\n============================================================\n'
@@ -117,6 +126,10 @@ run_training() {
     cmd+=("--no-wandb")
   fi
 
+  if [[ "$USE_MIX_SCHEDULE" == "1" && "$config_rel" != "$ROBOT_ONLY_CONFIG" ]]; then
+    cmd+=("--mix-schedule-profile" "$MIX_SCHEDULE_PROFILE")
+  fi
+
   printf 'Command:'
   printf ' %q' "${cmd[@]}"
   printf '\n'
@@ -140,6 +153,8 @@ echo "Human masked data: $HUMAN_MASKED_DATA"
 echo "Human unmasked data: $HUMAN_UNMASKED_DATA"
 echo "Output root: $OUTPUT_ROOT"
 echo "Debug mode: $DEBUG_MODE"
+echo "Use mix schedule: $USE_MIX_SCHEDULE"
+echo "Mix schedule profile: $MIX_SCHEDULE_PROFILE"
 echo "Batch size override: $BATCH_SIZE"
 echo "Run range: $START_AT -> $END_AT"
 
@@ -174,23 +189,23 @@ fi
 if should_run 2 "$RUN_ROBOT_HUMAN_MASKED"; then
   run_training \
     2 \
-    "pap_robot_human_masked" \
+    "pap_robot_human_masked${PAIRED_RUN_SUFFIX}" \
     "$MASKED_CONFIG" \
     "$ROBOT_DATA" \
     "$HUMAN_MASKED_DATA" \
-    "robot_human_masked" \
-    "${RUN_TAG}_robot_human_masked"
+    "robot_human_masked${PAIRED_RUN_SUFFIX}" \
+    "${RUN_TAG}_robot_human_masked${PAIRED_RUN_SUFFIX}"
 fi
 
 if should_run 3 "$RUN_ROBOT_HUMAN_UNMASKED"; then
   run_training \
     3 \
-    "pap_robot_human_unmasked" \
+    "pap_robot_human_unmasked${PAIRED_RUN_SUFFIX}" \
     "$UNMASKED_CONFIG" \
     "$ROBOT_DATA" \
     "$HUMAN_UNMASKED_DATA" \
-    "robot_human_unmasked" \
-    "${RUN_TAG}_robot_human_unmasked"
+    "robot_human_unmasked${PAIRED_RUN_SUFFIX}" \
+    "${RUN_TAG}_robot_human_unmasked${PAIRED_RUN_SUFFIX}"
 fi
 
 banner "Launcher finished"

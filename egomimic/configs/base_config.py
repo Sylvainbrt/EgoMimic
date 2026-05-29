@@ -244,6 +244,10 @@ class BaseConfig(Config):
         self.train.batch_size = 100  # batch size
         self.train.num_epochs = 2000  # number of training epochs
         self.train.seed = 1  # seed for training (for reproducibility)
+        self.train.mix_schedule.enabled = False
+        self.train.mix_schedule.unit = "epoch"
+        self.train.mix_schedule.normalize = True
+        self.train.mix_schedule.do_not_lock_keys()
 
     def algo_config(self):
         """

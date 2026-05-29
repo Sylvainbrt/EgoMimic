@@ -33,6 +33,18 @@ import numpy as np
 import egomimic
 
 
+def apply_mix_schedule_profile(config, profile):
+    if profile is None:
+        return
+
+    if profile == "none":
+        config.train.mix_schedule.enabled = False
+        return
+
+    config.train.mix_schedule.enabled = True
+    config.train.mix_schedule.profile = profile
+
+
 def main(args):
     # set random seeds
     torch.manual_seed(0)
@@ -88,6 +100,8 @@ def main(args):
     
     if args.hand_lambda is not None:
         config.algo.sp.hand_lambda = args.hand_lambda
+
+    apply_mix_schedule_profile(config, args.mix_schedule_profile)
 
     if args.batch_size:
         config.train.batch_size = args.batch_size
@@ -290,6 +304,13 @@ def train_argparse():
     parser.add_argument("--lr", type=float, default=None, help="learning rate")
 
     parser.add_argument("--hand-lambda", type=float, default=None, help="hand data weighting")
+
+    parser.add_argument(
+        "--mix-schedule-profile",
+        choices=("none", "soft", "default", "aggressive"),
+        default=None,
+        help="optional named train.mix_schedule profile override",
+    )
 
     parser.add_argument("--batch-size", type=int, default=None, help="batch size")
 

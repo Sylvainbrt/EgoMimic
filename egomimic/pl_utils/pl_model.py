@@ -55,6 +55,76 @@ class ModelWrapper(LightningModule):
 
         # TODO __init__ should take the config, and init the model here.  Then save_hyperparameters will just save the config rather than the model
 
+    def _mix_schedule_cfg(self):
+        schedule = self.model.global_config.train.get("mix_schedule", None)
+        if not schedule or not schedule.get("enabled", False):
+            return None
+        return schedule
+
+    def _get_mix_schedule_coord(self):
+        schedule = self._mix_schedule_cfg()
+        if schedule is None:
+            return 0
+
+        unit = schedule.get("unit", "epoch")
+        if unit == "epoch":
+            return int(self.current_epoch)
+        if unit == "step":
+            return int(self.global_step)
+        if unit == "progress":
+            max_epochs = getattr(getattr(self, "trainer", None), "max_epochs", None)
+            if max_epochs is None or max_epochs <= 0:
+                max_epochs = self.model.global_config.train.num_epochs
+            return float(self.current_epoch) / max(1, int(max_epochs) - 1)
+
+        raise ValueError(f"Unsupported mix schedule unit: {unit}")
+
+    @staticmethod
+    def _eval_piecewise_linear(points, coord):
+        if not points:
+            return 1.0
+
+        parsed_points = sorted((float(x), float(y)) for x, y in points)
+        if coord <= parsed_points[0][0]:
+            return parsed_points[0][1]
+
+        for (x0, y0), (x1, y1) in zip(parsed_points, parsed_points[1:]):
+            if coord <= x1:
+                if x1 == x0:
+                    return y1
+                alpha = (coord - x0) / (x1 - x0)
+                return y0 + alpha * (y1 - y0)
+
+        return parsed_points[-1][1]
+
+    def _get_mix_weight(self, domain_name):
+        schedule = self._mix_schedule_cfg()
+        if schedule is None:
+            return 1.0
+
+        domains = schedule.get("domains", {})
+        profiles = schedule.get("profiles", {})
+        if profiles:
+            profile_name = schedule.get("profile", "default")
+            if profile_name not in profiles:
+                raise ValueError(f"Unknown mix schedule profile: {profile_name}")
+            domains = profiles[profile_name].get("domains", domains)
+
+        domain_cfg = domains.get(domain_name, None)
+        if not domain_cfg:
+            return 1.0
+
+        schedule_type = domain_cfg.get("type", "constant")
+        if schedule_type == "constant":
+            return float(domain_cfg.get("value", 1.0))
+        if schedule_type == "piecewise_linear":
+            return self._eval_piecewise_linear(
+                domain_cfg.get("points", []),
+                self._get_mix_schedule_coord(),
+            )
+
+        raise ValueError(f"Unsupported mix schedule type: {schedule_type}")
+
     def training_step(self, batch, batch_idx):
         DUAL_DL = isinstance(batch, list)
         # plt.imsave("debug/front_img_1.png", batch[0]["obs"]["front_img_1"][0, 0].cpu().numpy())
@@ -65,6 +135,7 @@ class ModelWrapper(LightningModule):
         loss_dicts = []
         if not DUAL_DL:
             batch = [batch]
+        domain_names = ["robot", "hand"] if self.dual_dl else ["robot"]
         ac_keys = (
             [
                 self.model.global_config.train.ac_key,
@@ -92,15 +163,36 @@ class ModelWrapper(LightningModule):
             losses = self.model._compute_losses(predictions, batch)
             loss_dicts.append(losses)
 
+        schedule = self._mix_schedule_cfg()
+        mix_weights = [self._get_mix_weight(name) for name in domain_names[: len(loss_dicts)]]
+        normalize = True if schedule is None else bool(schedule.get("normalize", True))
+        weight_sum = float(sum(mix_weights))
+
         # Average over both the hand and robot batch if applicable
         losses = OrderedDict()
         for key in loss_dicts[0].keys():
-            losses[key] = torch.mean(
-                torch.stack([loss_dict[key] for loss_dict in loss_dicts])
+            if schedule is None:
+                losses[key] = torch.mean(
+                    torch.stack([loss_dict[key] for loss_dict in loss_dicts])
+                )
+                continue
+
+            weighted_losses = torch.stack(
+                [
+                    loss_dict[key] * mix_weight
+                    for mix_weight, loss_dict in zip(mix_weights, loss_dicts)
+                ]
             )
+            losses[key] = torch.sum(weighted_losses)
+            if normalize and weight_sum > 0:
+                losses[key] = losses[key] / weight_sum
 
         info["losses"] = TensorUtils.detach(losses)
-        self.step_log_all_train.append(self.model.log_info(info))
+        train_log = self.model.log_info(info)
+        if schedule is not None:
+            for domain_name, mix_weight in zip(domain_names[: len(loss_dicts)], mix_weights):
+                train_log[f"Mix_Weight_{domain_name}"] = mix_weight
+        self.step_log_all_train.append(train_log)
 
         # count=0
         # for name, param in self.named_parameters():
