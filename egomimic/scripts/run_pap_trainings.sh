@@ -23,14 +23,14 @@ ROBOT_DATA="${ROBOT_DATA:-/data/sybeuret/remote_converted_lerobot_data/pick_and_
 HUMAN_MASKED_DATA="${HUMAN_MASKED_DATA:-/data/sybeuret/aria_gen2_data/converted/pick_and_place_280526_masked_left.hdf5}"
 HUMAN_UNMASKED_DATA="${HUMAN_UNMASKED_DATA:-$HUMAN_MASKED_DATA}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-/data/sybeuret/output_trainings_egomimic/pap_debug_sequence}"
-RUN_TAG="${RUN_TAG:-pap_debug_small}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/data/sybeuret/output_trainings_egomimic/pap_full_sequence}"
+RUN_TAG="${RUN_TAG:-pap_full}"
 
-DEBUG_MODE="${DEBUG_MODE:-1}"
-NO_WANDB="${NO_WANDB:-1}"
+DEBUG_MODE="${DEBUG_MODE:-0}"
+NO_WANDB="${NO_WANDB:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 NUM_NODES="${NUM_NODES:-1}"
 
