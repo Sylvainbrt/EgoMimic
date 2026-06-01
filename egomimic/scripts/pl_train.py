@@ -105,6 +105,9 @@ def main(args):
 
     if args.batch_size:
         config.train.batch_size = args.batch_size
+
+    if args.num_epochs is not None:
+        config.train.num_epochs = args.num_epochs
     
     if args.train_key:
         config.train.hdf5_filter_key = args.train_key
@@ -313,6 +316,13 @@ def train_argparse():
     )
 
     parser.add_argument("--batch-size", type=int, default=None, help="batch size")
+
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=None,
+        help="optional override for config.train.num_epochs",
+    )
 
     parser.add_argument(
         "--wandb_project_name",

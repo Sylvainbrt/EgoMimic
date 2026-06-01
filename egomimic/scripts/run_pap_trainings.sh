@@ -33,6 +33,7 @@ USE_MIX_SCHEDULE="${USE_MIX_SCHEDULE:-0}"
 MIX_SCHEDULE_PROFILE="${MIX_SCHEDULE_PROFILE:-default}"
 
 BATCH_SIZE="${BATCH_SIZE:-8}"
+NUM_EPOCHS="${NUM_EPOCHS:-500}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
 NUM_NODES="${NUM_NODES:-1}"
 
@@ -110,6 +111,7 @@ run_training() {
     "--name" "$label"
     "--description" "$description"
     "--batch-size" "$BATCH_SIZE"
+    "--num-epochs" "$NUM_EPOCHS"
     "--gpus-per-node" "$GPUS_PER_NODE"
     "--num-nodes" "$NUM_NODES"
   )
@@ -156,6 +158,7 @@ echo "Debug mode: $DEBUG_MODE"
 echo "Use mix schedule: $USE_MIX_SCHEDULE"
 echo "Mix schedule profile: $MIX_SCHEDULE_PROFILE"
 echo "Batch size override: $BATCH_SIZE"
+echo "Num epochs override: $NUM_EPOCHS"
 echo "Run range: $START_AT -> $END_AT"
 
 [[ "$START_AT" =~ ^[0-9]+$ ]] || die "START_AT must be an integer"
