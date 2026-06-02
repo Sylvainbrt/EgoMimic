@@ -20,6 +20,7 @@ Args:
 import argparse
 import json
 import os
+import sys
 import traceback
 from egomimic.configs import config_factory
 import datetime
@@ -108,6 +109,9 @@ def main(args):
 
     if args.num_epochs is not None:
         config.train.num_epochs = args.num_epochs
+
+    if args.num_data_workers is not None:
+        config.train.num_data_workers = args.num_data_workers
     
     if args.train_key:
         config.train.hdf5_filter_key = args.train_key
@@ -211,6 +215,7 @@ def main(args):
     # catch error during training and print it
     res_str = "finished run successfully!"
     important_stats = None
+    exit_code = 0
     try:
         if args.eval:
             eval(config, args.ckpt_path, type=config.train.data_type)
@@ -220,10 +225,13 @@ def main(args):
         important_stats = json.dumps(important_stats, indent=4)
     except Exception as e:
         res_str = "run failed with error:\n{}\n\n{}".format(e, traceback.format_exc())
+        exit_code = 1
     print(res_str)
     if important_stats is not None:
         print("\nRollout Success Rate Stats")
         print(important_stats)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def train_argparse():
@@ -322,6 +330,13 @@ def train_argparse():
         type=int,
         default=None,
         help="optional override for config.train.num_epochs",
+    )
+
+    parser.add_argument(
+        "--num-data-workers",
+        type=int,
+        default=None,
+        help="optional override for config.train.num_data_workers",
     )
 
     parser.add_argument(

@@ -258,7 +258,8 @@ def train(config, ckpt_path=None):
     #     callbacks.append(
     #         StochasticWeightAveraging(swa_lrs=config.algo.optim_params.policy.learning_rate.initial)
     #     )
-    trainer = Trainer(
+    distributed_training = config.train.gpus_per_node * config.train.num_nodes > 1
+    trainer_kwargs = dict(
         max_epochs=config.train.num_epochs,
         limit_train_batches=config.experiment.epoch_every_n_steps,
         accelerator="gpu",
@@ -275,17 +276,25 @@ def train(config, ckpt_path=None):
         # precision=16 if config.train.amp_enabled else 32,
         precision=32,
         reload_dataloaders_every_n_epochs=0,
-        use_distributed_sampler=True,
-        strategy=DDPStrategy(
-            find_unused_parameters=True,
-            process_group_backend="nccl",
-            timeout=timedelta(minutes=60)
-        ),
-        # strategy="ddp_find_unused_parameters_true",
+        use_distributed_sampler=distributed_training,
         profiler="simple",
         # profiler=AdvancedProfiler(dirpath=".", filename="perf_logs")
         # if args.profiler != "none"
         # else None,
+    )
+    if distributed_training:
+        trainer_kwargs["strategy"] = DDPStrategy(
+            find_unused_parameters=True,
+            process_group_backend="nccl",
+            timeout=timedelta(minutes=60)
+        )
+    print(
+        "Lightning strategy: "
+        f"{'ddp_find_unused_parameters_true' if distributed_training else 'single_process'}"
+    )
+    trainer = Trainer(
+        **trainer_kwargs,
+        # strategy="ddp_find_unused_parameters_true",
     )
     print(f"NCCL WAIT TIME: {os.environ.get('NCCL_BLOCKING_WAIT', None)}")
     print(f"NCCL WAIT TIME: {os.environ.get('TORCH_NCCL_BLOCKING_WAIT', None)}")
